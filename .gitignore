@@ -211,3 +211,9 @@ scripts/plots/planar_4_link/inference_results*
 scripts/plots/panda_front_page_thesis/plots/
 
 scripts/plots/planar_4_link/plots*
+
+# local
+.vscode/
+data_outputs/
+eval_out/
+eval_out_dbg*/
