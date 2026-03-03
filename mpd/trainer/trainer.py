@@ -217,20 +217,21 @@ def train(
 
                     train_losses_l.append((train_steps_current, train_losses_log))
 
-                    with TimerCUDA() as t_training_summary:
-                        do_summary(
-                            summary_fn,
-                            train_steps_current,
-                            ema_model if ema_model is not None else model,
-                            train_batch_dict,
-                            train_losses_info,
-                            train_subset,
-                            planning_task=planning_task,
-                            prefix="TRAINING ",
-                            debug=debug,
-                            tensor_args=tensor_args,
-                        )
-                    print(f"t_training_summary: {t_training_summary.elapsed:.4f} sec")
+                    if os.environ.get("MPD_SKIP_SUMMARY", "0") != "1":
+                        with TimerCUDA() as t_training_summary:
+                            do_summary(
+                                summary_fn,
+                                train_steps_current,
+                                ema_model if ema_model is not None else model,
+                                train_batch_dict,
+                                train_losses_info,
+                                train_subset,
+                                planning_task=planning_task,
+                                prefix="TRAINING ",
+                                debug=debug,
+                                tensor_args=tensor_args,
+                            )
+                        print(f"t_training_summary: {t_training_summary.elapsed:.4f} sec")
 
                     ################################################################################################
                     # VALIDATION LOSS and SUMMARY
@@ -276,21 +277,23 @@ def train(
 
                         validation_losses_l.append((train_steps_current, validation_losses_log))
 
-                        # The validation summary is done only on one batch of the validation data
-                        with TimerCUDA() as t_validation_summary:
-                            do_summary(
-                                summary_fn,
-                                train_steps_current,
-                                ema_model if ema_model is not None else model,
-                                batch_dict_val,
-                                val_loss_info,
-                                val_subset,
-                                planning_task=planning_task,
-                                prefix="VALIDATION ",
-                                debug=debug,
-                                tensor_args=tensor_args,
-                            )
-                        print(f"t_valididation_summary: {t_validation_summary.elapsed:.4f} sec")
+
+                        if os.environ.get("MPD_SKIP_SUMMARY", "0") != "1":
+                            # The validation summary is done only on one batch of the validation data
+                            with TimerCUDA() as t_validation_summary:
+                                do_summary(
+                                    summary_fn,
+                                    train_steps_current,
+                                    ema_model if ema_model is not None else model,
+                                    batch_dict_val,
+                                    val_loss_info,
+                                    val_subset,
+                                    planning_task=planning_task,
+                                    prefix="VALIDATION ",
+                                    debug=debug,
+                                    tensor_args=tensor_args,
+                                )
+                            print(f"t_valididation_summary: {t_validation_summary.elapsed:.4f} sec")
 
                     wandb.log({**train_losses_log, **validation_losses_log}, step=train_steps_current)
 

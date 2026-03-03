@@ -51,6 +51,34 @@ def get_planning_task_and_dataset(
     tensor_args=DEFAULT_TENSOR_ARGS,
     **kwargs,
 ):
+    if dataset_subdir == "EagleGraspNPZ":
+        from mpd.datasets.eagle_grasp_npz_dataset import EagleGraspNPZDataset
+        import torch
+        from torch.utils.data import DataLoader, random_split
+
+        root_dir = dataset_file_merged   # /home/yongxin/wpj/dataset_room_4x4x2_relaxed
+        H = num_T_pts                    # 例如 144
+        ds = EagleGraspNPZDataset(root_dir, H=H)
+
+        # ✅ 关键：planning_task 来自 ds
+        planning_task = ds.planning_task
+
+        # split
+        n = len(ds)
+        n_val = min(200, max(1, int(0.05 * n)))
+        n_train = n - n_val
+        train_subset, val_subset = random_split(
+            ds, [n_train, n_val],
+            generator=torch.Generator().manual_seed(0)
+        )
+
+        train_dataloader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+        val_dataloader   = DataLoader(val_subset,   batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
+        print("[DBG] planning_task is None?", planning_task is None)
+        print("[DBG] has parametric_trajectory?", hasattr(planning_task, "parametric_trajectory"))
+
+        return planning_task, train_subset, train_dataloader, val_subset, val_dataloader
+
     dataset_subdir = dataset_subdir
     base_dir = os.path.join(DATASET_BASE_DIR, dataset_subdir)
 

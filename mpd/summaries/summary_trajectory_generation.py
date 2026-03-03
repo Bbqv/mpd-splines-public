@@ -67,13 +67,21 @@ class SummaryTrajectoryGeneration(SummaryBase):
         # unnormalize control points samples
         control_points = dataset.unnormalize_control_points(control_points_normalized)
 
-        # Get the bspline trajectory
+        # Get the trajectory (EagleGraspNPZ: control_points already is a trajectory)
         q_start = torch.cat(q_start_l, dim=0)
         q_goal = torch.cat(q_goal_l, dim=0)
-        q_pos_trajs = planning_task.parametric_trajectory.get_q_trajectory(
-            control_points, q_start, q_goal, get_type=["pos"]
-        )["pos"]
 
+        print("[DBG] parametric_trajectory type:", type(planning_task.parametric_trajectory))
+        print("[DBG] get_q_trajectory:", planning_task.parametric_trajectory.get_q_trajectory)
+
+        # In this dataset, control_points has shape (B, H, dof) and can be treated as q trajectory directly.
+        q_pos_trajs = control_points  # (B, H, 5)
+
+        if not hasattr(planning_task, "compute_fraction_valid_trajs"):
+            # EagleGrasp dummy task: skip env-based metrics
+            # 你可以在这里 wandb.log 一些简单指标，比如轨迹长度/平滑度/末端误差（用 q_goal）
+            return
+        
         # ------------------------------------------------------------------------------------
         # STATISTICS
         wandb.log(

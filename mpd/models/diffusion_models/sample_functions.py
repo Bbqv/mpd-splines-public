@@ -14,8 +14,35 @@ def extract(a, t, x_shape):
 
 
 def apply_hard_conditioning(x, conditions):
+    """
+    x: (B,H,D)
+    conditions: dict[int -> tensor]
+      allowed v shapes:
+        (D,), (1,D), (B,D), (B,1,D)
+    """
     for k, v in conditions.items():
-        x[:, k, :] = v.clone()
+        if torch.is_tensor(v):
+            vv = v
+            # (B,1,D) -> (B,D)
+            if vv.ndim == 3 and vv.shape[1] == 1:
+                vv = vv.squeeze(1)
+            # (D,) -> (1,D)
+            if vv.ndim == 1:
+                vv = vv.unsqueeze(0)
+            # (1,D) -> (B,D) (broadcast to batch)
+            if vv.shape[0] == 1 and x.shape[0] > 1:
+                vv = vv.repeat(x.shape[0], 1)
+            x[:, k, :] = vv.clone()
+        else:
+            # numpy or list -> convert then assign
+            vv = torch.as_tensor(v, device=x.device, dtype=x.dtype)
+            if vv.ndim == 1:
+                vv = vv.unsqueeze(0)
+            if vv.ndim == 3 and vv.shape[1] == 1:
+                vv = vv.squeeze(1)
+            if vv.shape[0] == 1 and x.shape[0] > 1:
+                vv = vv.repeat(x.shape[0], 1)
+            x[:, k, :] = vv.clone()
     return x
 
 

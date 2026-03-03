@@ -22,6 +22,17 @@ WANDB_MODE = "disabled"
 WANDB_ENTITY = "mpd-splines"
 DEBUG = True
 
+import torch.nn as nn
+
+class LinearNoneHook:
+    def __init__(self, name: str):
+        self.name = name
+
+    def __call__(self, mod, inp, out):
+        x = inp[0] if isinstance(inp, (tuple, list)) and len(inp) else None
+        if x is None:
+            raise RuntimeError(f"[DBG] Linear got None input at layer: {self.name}")
+
 
 @single_experiment_yaml
 def experiment(
@@ -129,6 +140,28 @@ def experiment(
 
     full_dataset = train_subset.dataset
 
+    # -------------------- DBG: inspect one batch --------------------
+    def _dbg_tensor(x):
+        if x is None:
+            return "None"
+        if not hasattr(x, "shape"):
+            return f"{type(x)}"
+        return f"shape={tuple(x.shape)} dtype={x.dtype} device={x.device}"
+
+    try:
+        train_batch_dict = next(iter(train_dataloader))
+        print("\n[DBG] one train batch keys:", sorted(train_batch_dict.keys()))
+        for k in sorted(train_batch_dict.keys()):
+            v = train_batch_dict[k]
+            if isinstance(v, dict):
+                print(f"[DBG] {k}: dict(keys={list(v.keys())})")
+            else:
+                print(f"[DBG] {k}: {_dbg_tensor(v)}")
+        print()
+    except Exception as e:
+        print("[DBG] failed to fetch one batch from train_dataloader:", repr(e))
+    # ---------------------------------------------------------------
+
     if debug:
         full_dataset.render(
             task_id=0,
@@ -194,6 +227,11 @@ def experiment(
         **unet_configs,
     )
 
+    # -------------------- DBG: catch which Linear gets None --------------------
+    for n, m in model.named_modules():
+        if isinstance(m, nn.Linear):
+            m.register_forward_hook(LinearNoneHook(n))
+    # --------------------------------------------------------------------------
     ########################################################################
     # Loss
     if generative_model_class == "GaussianDiffusionModel":
