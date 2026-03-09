@@ -1,4 +1,3 @@
-# mpd/datasets/eagle_grasp_npz_dataset.py
 import os, glob
 import numpy as np
 import pandas as pd
@@ -36,18 +35,16 @@ class EagleGraspNPZDataset(Dataset):
       traj/control_points: (H, 9)
         9 = base_pos(3) + base_quat(4) + arm_j(2)
         i.e. [x, y, z, qx, qy, qz, qw, j1, j2]
-      cond/context_q: (22,)
-        22 = start(9) + grasp_pos(3) + goal(9) + k_grasp_norm(1)
 
-    Additionally returns (for eval/debug):
-      states: (T,17) raw (no resample)
-      ee_positions: (T,3) raw (no resample)  (planner FK result)
-      controls: (T-1,6) raw (if present)
-      ee_positions_resampled: (H,3) (optional convenience)
+      cond/context_q: (22,)
+        22 = start(9) + goal(9) + grasp_pos(3) + k_grasp_norm(1)
+
+    NEW (scheme-3 support):
+      sg_xyz_normalized: (6,) = [start_xyz(3), goal_xyz(3)]
+      context_sg_xyz_normalized: same as above (explicit key for context models)
     """
 
     def __init__(self, root_dir: str, H: int = 141, only_accepted: bool = True):
-        # dummy planning_task for compatibility with train.py
         class _Env:
             dim = 3
 
@@ -57,23 +54,19 @@ class EagleGraspNPZDataset(Dataset):
         self.planning_task = _Task()
         self.planning_task.parametric_trajectory = _DummyParametricTrajectory()
 
-        # ---------- dims ----------
-        self.traj_state_dim = 9          # [pos3 + quat4 + joints2]
-        self.cond_dim = 22               # start9 + grasp3 + goal9 + k1
+        self.traj_state_dim = 9
+        self.cond_dim = 22
 
-        # --- compatibility attributes expected by mpd training code ---
         self.context_q_dim = self.cond_dim
         self.context_ee_goal_pose_dim = 0
         self.context_combined_dim = self.cond_dim
 
-        # --- field keys expected by mpd losses/normalization ---
         self.field_key_control_points = "control_points"
         self.field_key_context_q = "context_q"
         self.field_key_context_ee_goal_pose = "context_ee_goal_pose"
         self.field_key_context_combined = "context_combined"
         self.field_key_task_id = "case_id"
 
-        # trajectory dims expected by diffusion model
         self.control_points_dim = (H, self.traj_state_dim)
         self.state_dim = self.traj_state_dim
         self.dof = self.traj_state_dim
@@ -94,32 +87,42 @@ class EagleGraspNPZDataset(Dataset):
         assert os.path.exists(csv_path), f"Missing summary.csv at {csv_path}"
         df = pd.read_csv(csv_path)
 
-        # Keep accepted rows, and prefer the successful try per case_id
         if "accepted" in df.columns:
             df = df[df["accepted"] == True].copy()
 
-        # Map case_id -> grasp/goal and timing. Use the row with try_id minimal (first success)
         if "try_id" in df.columns:
             df = df.sort_values(["case_id", "try_id"])
             df = df.groupby("case_id").head(1)
 
-        # index by case_id for fast lookup
         self.by_case = df.set_index("case_id", drop=False)
 
     def __len__(self):
         return len(self.files)
 
     def unnormalize_control_points(self, control_points_normalized):
+        # In this dataset, normalized == raw (kept for API compatibility)
         return control_points_normalized
 
     def build_context(self, data_sample: dict):
         """
-        Minimal context builder for MPD summary / sampling.
-        It must return the same keys that ContextModelCombined.forward expects.
+        Keys for context_model:
+          - qs_normalized
+          - context_sg_xyz_normalized (preferred explicit key)
+          - sg_xyz_normalized (backward compatible)
+          - ee_goal_pose_normalized (optional)
         """
         context_d = {
             "qs_normalized": data_sample["qs_normalized"],
         }
+
+        # Prefer explicit key if present
+        if "context_sg_xyz_normalized" in data_sample:
+            context_d["context_sg_xyz_normalized"] = data_sample["context_sg_xyz_normalized"]
+            # also provide sg_xyz_normalized for models expecting it
+            context_d["sg_xyz_normalized"] = data_sample["context_sg_xyz_normalized"]
+        elif "sg_xyz_normalized" in data_sample:
+            context_d["sg_xyz_normalized"] = data_sample["sg_xyz_normalized"]
+
         if "ee_goal_pose_normalized" in data_sample:
             context_d["ee_goal_pose_normalized"] = data_sample["ee_goal_pose_normalized"]
         return context_d
@@ -129,44 +132,38 @@ class EagleGraspNPZDataset(Dataset):
 
     def __getitem__(self, idx):
         npz_path = self.files[idx]
-        base = os.path.basename(npz_path)  # traj_000123.npz
+        base = os.path.basename(npz_path)
         case_id = int(base.split("_")[1].split(".")[0])
 
-        # read csv row
         if case_id not in self.by_case.index:
             raise KeyError(f"case_id {case_id} not found in summary.csv (file={base})")
         row = self.by_case.loc[case_id]
 
         grasp = np.array([row["grasp_x"], row["grasp_y"], row["grasp_z"]], dtype=np.float32)
-        goal = np.array([row["goal_x"], row["goal_y"], row["goal_z"]], dtype=np.float32)
+        goal_xyz = np.array([row["goal_x"], row["goal_y"], row["goal_z"]], dtype=np.float32)
 
         dt = float(row["dt"])
-        t_grasp = float(row["to_grasp"])  # summary.csv column name in your generator
+        t_grasp = float(row["to_grasp"])
 
-        # ---- load npz ----
         data = np.load(npz_path, allow_pickle=True)
 
-        # raw trajectories
         if "states" not in data:
             raise KeyError(f"'states' missing in {npz_path}. Keys={list(data.keys())}")
-        states = data["states"].astype(np.float32)  # (T,17)
+        states = data["states"].astype(np.float32)
         T_npz = int(states.shape[0])
 
         if "ee_positions" not in data:
             raise KeyError(f"'ee_positions' missing in {npz_path}. Keys={list(data.keys())}")
-        ee_positions = data["ee_positions"].astype(np.float32)  # (T,3)
+        ee_positions = data["ee_positions"].astype(np.float32)
 
         controls = None
         if "controls" in data:
-            controls = data["controls"].astype(np.float32)  # (T-1,6) typically
+            controls = data["controls"].astype(np.float32)
 
-        # ---- compute k_grasp ----
-        # k_grasp is a time index; clamp in NPZ timeline first (T_npz),
-        # then normalize to dataset H timeline (since traj is resampled to H).
+        # grasp index (in resampled H grid)
         k_grasp_npz = int(round(t_grasp / max(dt, 1e-9)))
         k_grasp_npz = int(np.clip(k_grasp_npz, 0, T_npz - 1))
 
-        # map NPZ index to resampled index approximately
         if T_npz <= 1:
             k_grasp = 0
         else:
@@ -174,24 +171,13 @@ class EagleGraspNPZDataset(Dataset):
         k_grasp = int(np.clip(k_grasp, 0, self.H - 1))
         k_grasp_norm = np.array([k_grasp / (self.H - 1)], dtype=np.float32)
 
-        # ---- build training traj (H,9) ----
-        # traj from states: base_pos(0:3) + base_quat(3:7) + arm_j(7:9) => (T,9)
-        traj_raw = np.concatenate([states[:, 0:3], states[:, 3:7], states[:, 7:9]], axis=1).astype(np.float32)  # (T,9)
-        traj = resample_linear(traj_raw, self.H)  # (H,9)
+        # build raw trajectory [x,y,z,qx,qy,qz,qw,j1,j2]
+        traj_raw = np.concatenate([states[:, 0:3], states[:, 3:7], states[:, 7:9]], axis=1).astype(np.float32)
+        traj = resample_linear(traj_raw, self.H)
 
-        # also resample ee for convenience (eval can use raw ee_positions)
-        ee_positions_resampled = resample_linear(ee_positions.astype(np.float32), self.H)  # (H,3)
+        ee_positions_resampled = resample_linear(ee_positions.astype(np.float32), self.H)
 
-        # ---- build cond/context (22,) ----
-        start = traj[0].copy()       # (9,)
-        goal_state = traj[-1].copy() # (9,)
-        # overwrite goal position with CSV goal (optional but consistent)
-        goal_state[0:3] = goal
-
-        cond = np.concatenate([start, grasp, goal_state, k_grasp_norm], axis=0).astype(np.float32)  # (22,)
-
-        # -------- pad/crop trajectory length to dataset H (needed by TemporalUnet) --------
-        # (Note: after resample_linear, traj already has length H; keep this block harmless)
+        # ensure exact length H
         T = traj.shape[0]
         H = self.H
         if T < H:
@@ -200,45 +186,66 @@ class EagleGraspNPZDataset(Dataset):
         elif T > H:
             traj = traj[:H]
 
+        # start/goal states for conditioning
+        start_state = traj[0].copy().astype(np.float32)
+        goal_state = traj[-1].copy().astype(np.float32)
+
+        # IMPORTANT: make GT trajectory end consistent with goal_xyz conditioning
+        # (otherwise diffusion loss pulls toward traj[-1] while aux pulls toward goal_xyz -> conflict)
+        traj[-1, 0:3] = goal_xyz
+        goal_state[0:3] = goal_xyz
+
+        cond = np.concatenate([start_state, goal_state, grasp, k_grasp_norm], axis=0).astype(np.float32)
+        if cond.shape[0] != self.cond_dim:
+            raise RuntimeError(f"cond dim mismatch: got {cond.shape[0]} expected {self.cond_dim}")
+
+        # Explicit start/goal xyz conditioning
+        # start xyz from start_state (traj[0])
+        start_xyz = start_state[0:3].copy()
+        sg_xyz = np.concatenate([start_xyz, goal_xyz], axis=0).astype(np.float32)
+
         out = {
-            # raw (your names)
             "traj": torch.from_numpy(traj),
             "cond": torch.from_numpy(cond),
 
-            # raw (framework-expected names)
-            "control_points": torch.from_numpy(traj),  # (H,9)
-            "context_q": torch.from_numpy(cond),       # (22,)
-            "context_ee_goal_pose": torch.zeros(1, dtype=torch.float32),  # keep dim 1
-            "context_combined": torch.from_numpy(cond),                   # (22,)
+            "control_points": torch.from_numpy(traj),
+            "context_q": torch.from_numpy(cond),
+            "context_ee_goal_pose": torch.zeros(1, dtype=torch.float32),
+            "context_combined": torch.from_numpy(cond),
             "case_id": torch.tensor(case_id, dtype=torch.long),
 
-            # normalized (identity for now, to satisfy gaussian_diffusion_loss)
             "control_points_normalized": torch.from_numpy(traj),
             "context_q_normalized": torch.from_numpy(cond),
             "context_ee_goal_pose_normalized": torch.zeros(1, dtype=torch.float32),
             "context_combined_normalized": torch.from_numpy(cond),
 
-            # ---- extra GT for eval/debug ----
-            "states": torch.from_numpy(states),                    # (T,17) raw
-            "ee_positions": torch.from_numpy(ee_positions),        # (T,3) raw
-            "ee_positions_resampled": torch.from_numpy(ee_positions_resampled),  # (H,3)
+            # NEW: explicit sg keys (preferred by models)
+            "context_sg_xyz": torch.from_numpy(sg_xyz),
+            "context_sg_xyz_normalized": torch.from_numpy(sg_xyz),
+
+            # Backward compatible key (some code expects this exact name)
+            "sg_xyz_normalized": torch.from_numpy(sg_xyz),
+
+            "states": torch.from_numpy(states),
+            "ee_positions": torch.from_numpy(ee_positions),
+            "ee_positions_resampled": torch.from_numpy(ee_positions_resampled),
         }
 
         if controls is not None:
-            out["controls"] = torch.from_numpy(controls)  # (T-1,6)
+            out["controls"] = torch.from_numpy(controls)
 
-        # aliases expected elsewhere
+        # alias expected by other parts of MPD code
         out["qs"] = out["context_q"]
         out["qs_normalized"] = out["context_q_normalized"]
 
         out["ee_goal_pose"] = out["context_ee_goal_pose"]
         out["ee_goal_pose_normalized"] = out["context_ee_goal_pose_normalized"]
 
-        # convenience slices (world frame)
-        # cond = [start(9), grasp(3), goal(9), k(1)]
+        # convenience slices (documented layout)
         out["q_start"] = out["context_q"][0:9].clone()
-        out["q_grasp"] = out["context_q"][9:12].clone()
-        out["q_goal"]  = out["context_q"][12:21].clone()
+        out["q_goal"] = out["context_q"][9:18].clone()
+        out["q_grasp"] = out["context_q"][18:21].clone()
+        out["k_grasp_norm"] = out["context_q"][21:22].clone()
 
         out["hard_conds"] = {}
 

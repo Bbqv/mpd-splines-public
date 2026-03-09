@@ -4,11 +4,10 @@ import numpy as np
 import math
 
 import torch
-import matplotlib.pyplot as plt
 import pinocchio as pin
+import torch.nn as nn
 
 from mpd.datasets.eagle_grasp_npz_dataset import EagleGraspNPZDataset
-import torch.nn as nn
 
 # ===================== cond_encoder adapters =====================
 
@@ -56,7 +55,7 @@ def patch_all_cond_encoders(denoiser: nn.Module, expected_dim: int = 160) -> int
 
 class ContextSqueezeWrapper(nn.Module):
     """
-    Make context embedding compatible with denoiser cond_encoder:
+    Wrap denoiser forward(x,t,context):
       - ensure context is 2D (B,K)
       - if context is 3D (B,L,K): mean-pool over L -> (B,K)
       - then pad/trim K to expected_dim (default 160, inferred if possible)
@@ -154,33 +153,25 @@ def traj5_to_traj9(traj5: np.ndarray, q_start9: np.ndarray, q_goal9: np.ndarray)
     return out
 
 
-def fk_min_grasp_err_from_traj9(traj9, q_grasp_xyz):
-    traj9 = np.asarray(traj9, dtype=np.float64)
-    q_grasp_xyz = np.asarray(q_grasp_xyz, dtype=np.float64)
-
-    H = traj9.shape[0]
-    ee = np.zeros((H, 3), dtype=np.float64)
-
-    for t in range(H):
-        q = traj9[t].copy()
-        q[3:7] = _quat_norm_xyzw(q[3:7])
-        pin.forwardKinematics(_model_fk, _data_fk, q)
-        pin.updateFramePlacements(_model_fk, _data_fk)
-        ee[t] = _data_fk.oMf[_fid].translation
-
-    d = np.linalg.norm(ee - q_grasp_xyz[None, :], axis=1)
-    return float(d.min())
-
-
-def fk_xyz_and_jac_pos(q9):
+def fk_ee_xyz_from_q9(q9):
     q9 = np.asarray(q9, dtype=np.float64).copy()
     q9[3:7] = _quat_norm_xyzw(q9[3:7])
     pin.forwardKinematics(_model_fk, _data_fk, q9)
     pin.updateFramePlacements(_model_fk, _data_fk)
-    ee = _data_fk.oMf[_fid].translation.copy()
-    J6 = pin.computeFrameJacobian(_model_fk, _data_fk, q9, _fid, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
-    Jpos = J6[:3, :].copy()
-    return ee, Jpos
+    return _data_fk.oMf[_fid].translation.copy()
+
+
+def fk_min_grasp_err_from_traj9(traj9, q_grasp_xyz):
+    traj9 = np.asarray(traj9, dtype=np.float64)
+    q_grasp_xyz = np.asarray(q_grasp_xyz, dtype=np.float64)
+    H = traj9.shape[0]
+    ee = np.zeros((H, 3), dtype=np.float64)
+
+    for t in range(H):
+        ee[t] = fk_ee_xyz_from_q9(traj9[t])
+
+    d = np.linalg.norm(ee - q_grasp_xyz[None, :], axis=1)
+    return float(d.min())
 
 
 def ik_solve_pos_dls(
@@ -236,16 +227,6 @@ def ik_solve_pos_dls(
 
 # ===================== helpers =====================
 
-def grasp_index_from_times(H: int, to_grasp: float, to_target: float) -> int:
-    frac = float(to_grasp) / float(to_grasp + to_target + 1e-9)
-    idx = int(round(frac * (H - 1)))
-    return max(0, min(H - 1, idx))
-
-
-def l2(x: torch.Tensor, y: torch.Tensor, dim=-1) -> torch.Tensor:
-    return torch.linalg.norm(x - y, dim=dim)
-
-
 def _context_to_batch(x: torch.Tensor, B: int) -> torch.Tensor:
     if x is None:
         return None
@@ -279,21 +260,6 @@ def _context_to_batch(x: torch.Tensor, B: int) -> torch.Tensor:
         return x[:B].contiguous()
     reps = (B + N - 1) // N
     return x.repeat(reps, 1)[:B].contiguous()
-
-
-def quat_xyzw_to_yaw(q_xyzw):
-    x, y, z, w = [float(v) for v in q_xyzw]
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return math.atan2(siny_cosp, cosy_cosp)
-
-
-def q9_to_q5(q9):
-    q9 = np.asarray(q9, dtype=np.float64)
-    x, y = float(q9[0]), float(q9[1])
-    yaw = quat_xyzw_to_yaw(q9[3:7])
-    j1, j2 = float(q9[7]), float(q9[8])
-    return np.array([x, y, yaw, j1, j2], dtype=np.float64)
 
 
 def try_normalize_cp(dataset, cp_unnorm_tensor):
@@ -368,6 +334,53 @@ def adapt_qs_normalized(context_d: dict, expected_dim: int, idx: int):
         print(f"[CTX_FIX] qs_normalized: {cur} -> {expected_dim}")
 
 
+def apply_ctx_mode_to_context(context_d: dict, ctx_mode: str, idx: int = 0):
+    """
+    Apply sensitivity perturbation to context_d["qs_normalized"].
+    - orig: no change
+    - zero_ctx: set qs_normalized to zero
+    - swap_start_goal: swap first 9 dims and next 9 dims (assume start(9)+goal(9)+extra = 22)
+    """
+    if ctx_mode == "orig":
+        return
+    if "qs_normalized" not in context_d:
+        if idx == 0:
+            print("[SENS] qs_normalized not found in context_d; ctx_mode skipped")
+        return
+    qs = context_d["qs_normalized"]
+    if not torch.is_tensor(qs):
+        if idx == 0:
+            print("[SENS] qs_normalized is not tensor; ctx_mode skipped")
+        return
+
+    # ensure 2D (B,K)
+    if qs.dim() == 1:
+        qs = qs.unsqueeze(0)
+    if qs.dim() == 3 and qs.shape[1] == 1:
+        qs = qs.squeeze(1)
+    if qs.dim() != 2:
+        qs = qs.reshape(qs.shape[0], -1)
+
+    if ctx_mode == "zero_ctx":
+        qs = torch.zeros_like(qs)
+    elif ctx_mode == "swap_start_goal":
+        if qs.shape[1] >= 18:
+            tmp = qs.clone()
+            tmp[:, 0:9] = qs[:, 9:18]
+            tmp[:, 9:18] = qs[:, 0:9]
+            qs = tmp
+        else:
+            if idx == 0:
+                print("[SENS] swap_start_goal skipped: qs dim < 18")
+
+    context_d["qs_normalized"] = qs
+    if idx == 0:
+        with torch.no_grad():
+            m = float(qs.mean().item())
+            s = float(qs.std().item())
+            print(f"[SENS] ctx_mode={ctx_mode}, qs stats: mean={m:.4f}, std={s:.4f}, shape={tuple(qs.shape)}")
+
+
 class ContextModelPadTrimWrapper(nn.Module):
     def __init__(self, inner: nn.Module, expected_dim: int = 160):
         super().__init__()
@@ -401,6 +414,135 @@ class ContextModelPadTrimWrapper(nn.Module):
         return emb
 
 
+class ContextModelSqueezeOnly(nn.Module):
+    """
+    Squeeze-only wrapper for context_model:
+      - if output is (B,1,K) or (B,L,K), mean-pool over dim=1 -> (B,K)
+      - no pad/trim
+    """
+    def __init__(self, inner: nn.Module):
+        super().__init__()
+        self.inner = inner
+        self._printed = False
+
+    def forward(self, **kwargs):
+        emb = self.inner(**kwargs)
+        if torch.is_tensor(emb):
+            if emb.dim() == 3:
+                emb = emb.mean(dim=1)
+            elif emb.dim() > 3:
+                emb = emb.reshape(emb.shape[0], -1)
+            if (not self._printed) and emb.dim() == 2:
+                print("[CTX_SQUEEZE_ONLY] context_emb shape =", (int(emb.shape[0]), int(emb.shape[1])))
+                self._printed = True
+        return emb
+
+
+def _stats_np(x):
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    return {
+        "mean": float(np.mean(x)),
+        "p50": float(np.percentile(x, 50)),
+        "p90": float(np.percentile(x, 90)),
+    }
+
+
+# ===================== SMOOTHNESS METRICS =====================
+
+def _wrap_to_pi(a):
+    # a: np.ndarray
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _yaw_from_xyzw(q_xyzw):
+    # q = [x,y,z,w]
+    x, y, z, w = float(q_xyzw[0]), float(q_xyzw[1]), float(q_xyzw[2]), float(q_xyzw[3])
+    # yaw from quaternion (assuming z-rotation dominant / free-flyer yaw)
+    # yaw = atan2(2(wz + xy), 1 - 2(y^2 + z^2))
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def compute_smooth_metrics_traj9(traj9_np):
+    """
+    traj9_np: (H,9) in unnormalized metric space.
+    Returns dict of smoothness metrics (mean/max of |v|,|a|,|j| for xyz; plus yaw & arm joints).
+    """
+    traj = np.asarray(traj9_np, dtype=np.float64)
+    H = traj.shape[0]
+
+    out = {}
+
+    # ---- UAV xyz ----
+    xyz = traj[:, 0:3]  # (H,3)
+    if H >= 2:
+        v = xyz[1:] - xyz[:-1]            # (H-1,3)
+        v_norm = np.linalg.norm(v, axis=1)
+        out["uav_v_mean"] = float(v_norm.mean())
+        out["uav_v_max"] = float(v_norm.max())
+    else:
+        out["uav_v_mean"] = 0.0
+        out["uav_v_max"] = 0.0
+
+    if H >= 3:
+        a = (xyz[2:] - 2.0 * xyz[1:-1] + xyz[:-2])   # (H-2,3)
+        a_norm = np.linalg.norm(a, axis=1)
+        out["uav_a_mean"] = float(a_norm.mean())
+        out["uav_a_max"] = float(a_norm.max())
+    else:
+        out["uav_a_mean"] = 0.0
+        out["uav_a_max"] = 0.0
+
+    if H >= 4:
+        # jerk via third difference
+        j = (xyz[3:] - 3.0 * xyz[2:-1] + 3.0 * xyz[1:-2] - xyz[:-3])  # (H-3,3)
+        j_norm = np.linalg.norm(j, axis=1)
+        out["uav_j_mean"] = float(j_norm.mean())
+        out["uav_j_max"] = float(j_norm.max())
+    else:
+        out["uav_j_mean"] = 0.0
+        out["uav_j_max"] = 0.0
+
+    # ---- yaw smoothness from quaternion ----
+    yaws = np.array([_yaw_from_xyzw(traj[t, 3:7]) for t in range(H)], dtype=np.float64)
+    if H >= 2:
+        dy = _wrap_to_pi(yaws[1:] - yaws[:-1])
+        out["yaw_v_mean"] = float(np.mean(np.abs(dy)))
+        out["yaw_v_max"] = float(np.max(np.abs(dy)))
+    else:
+        out["yaw_v_mean"] = 0.0
+        out["yaw_v_max"] = 0.0
+
+    if H >= 3:
+        ddy = _wrap_to_pi(yaws[2:] - 2.0 * yaws[1:-1] + yaws[:-2])
+        out["yaw_a_mean"] = float(np.mean(np.abs(ddy)))
+        out["yaw_a_max"] = float(np.max(np.abs(ddy)))
+    else:
+        out["yaw_a_mean"] = 0.0
+        out["yaw_a_max"] = 0.0
+
+    # ---- arm joints q7,q8 (assume last 2 dims are joints) ----
+    arm = traj[:, 7:9]  # (H,2)
+    if H >= 2:
+        dq = arm[1:] - arm[:-1]
+        dq_norm = np.linalg.norm(dq, axis=1)
+        out["arm_v_mean"] = float(dq_norm.mean())
+        out["arm_v_max"] = float(dq_norm.max())
+    else:
+        out["arm_v_mean"] = 0.0
+        out["arm_v_max"] = 0.0
+
+    if H >= 3:
+        ddq = arm[2:] - 2.0 * arm[1:-1] + arm[:-2]
+        ddq_norm = np.linalg.norm(ddq, axis=1)
+        out["arm_a_mean"] = float(ddq_norm.mean())
+        out["arm_a_max"] = float(ddq_norm.max())
+    else:
+        out["arm_a_mean"] = 0.0
+        out["arm_a_max"] = 0.0
+
+    return out
+
+
 # ===================== main =====================
 
 @torch.no_grad()
@@ -413,10 +555,45 @@ def main():
     ap.add_argument("--n_samples", type=int, default=25)
     ap.add_argument("--save_dir", type=str, default="eval_out")
     ap.add_argument("--H", type=int, default=144)
-    ap.add_argument("--to_grasp_default", type=float, default=3.0)
-    ap.add_argument("--to_target_default", type=float, default=4.0)
-    ap.add_argument("--plot_max_trajs", type=int, default=25)
+
+    # evaluation mode
+    ap.add_argument(
+        "--mode",
+        type=str,
+        default="free",
+        choices=["free", "endpoints_hard", "endpoints_and_mid_hard"],
+        help="free: no hard cond. endpoints_hard: hard endpoints only. endpoints_and_mid_hard: hard endpoints+mid grasp (legacy)."
+    )
+    ap.add_argument("--tg_scan", action="store_true", help="If set, scan t_g_list in hard-mid mode.")
+    ap.add_argument("--t_g", type=int, default=24, help="Mid-grasp timestep for endpoints_and_mid_hard when tg_scan is false.")
+    ap.add_argument("--succ_thresh_m", type=float, default=0.02)
+
+    # sensitivity
+    ap.add_argument("--seed", type=int, default=0, help="fixed random seed for sensitivity test")
+    ap.add_argument("--ctx_mode", type=str, default="orig", choices=["orig", "swap_start_goal", "zero_ctx"],
+                    help="context perturbation mode (sensitivity test)")
+    ap.add_argument("--no_wrap_patch", action="store_true",
+                    help="Disable pad/trim + denoiser squeeze + cond_encoder adapters; keep context_model squeeze-only to avoid (B,1,K).")
+
+    # endpoint debug print
+    ap.add_argument("--dbg_eval", action="store_true",
+                    help="Print start/goal and predicted endpoints for case 0 (for coordinate sanity check).")
+
+    # NEW: smooth debug
+    ap.add_argument("--dbg_smooth", action="store_true",
+                    help="Print smoothness metrics for a couple of samples in case 0.")
+
     args = ap.parse_args()
+
+    # --- fixed seed for sensitivity ---
+    import random as _random
+    _random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    print(f"[SENS] seed={args.seed}, ctx_mode={args.ctx_mode}, no_wrap_patch={args.no_wrap_patch}")
+    # --- end fixed seed ---
 
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device(args.device)
@@ -429,6 +606,8 @@ def main():
     H = args.H
     print("[INFO] dataset len =", len(dataset))
     print("[INFO] H =", H)
+    print("[INFO] mode =", args.mode)
+    print("[INFO] QS_DIM_EXPECTED =", "TBD (after ckpt load)")
 
     ckpt_obj = torch.load(args.ckpt, map_location="cpu")
 
@@ -447,129 +626,152 @@ def main():
     QS_DIM_EXPECTED = get_expected_qs_dim(model)
     print("[INFO] QS_DIM_EXPECTED =", QS_DIM_EXPECTED)
 
+    # -------- wrap/patch (optional) --------
     if hasattr(model, "context_model"):
-        model.context_model = ContextModelPadTrimWrapper(model.context_model, expected_dim=160).to(device)
-        print("[INFO] Wrapped context_model to output (B,160)")
+        if args.no_wrap_patch:
+            model.context_model = ContextModelSqueezeOnly(model.context_model).to(device)
+            print("[INFO] no_wrap_patch=True: use ContextModelSqueezeOnly (no pad/trim)")
+        else:
+            model.context_model = ContextModelPadTrimWrapper(model.context_model, expected_dim=160).to(device)
+            print("[INFO] Wrapped context_model to output (B,160)")
 
     print("[INFO] Loaded model type:", type(model))
 
-    # squeeze internal context if needed
-    if hasattr(model, "model"):
-        denoiser = model.model
-        if isinstance(denoiser, torch.nn.DataParallel):
-            inner = denoiser.module
-            wrapped = ContextSqueezeWrapper(inner, expected_dim=160).to(device)
-            model.model = torch.nn.DataParallel(wrapped)
-        else:
-            model.model = ContextSqueezeWrapper(denoiser, expected_dim=160).to(device)
-    print("[INFO] Wrapped denoiser with ContextSqueezeWrapper (squeeze Bx1xK -> BxK)")
+    if not args.no_wrap_patch:
+        # squeeze internal context if needed
+        if hasattr(model, "model"):
+            denoiser = model.model
+            if isinstance(denoiser, torch.nn.DataParallel):
+                inner = denoiser.module
+                wrapped = ContextSqueezeWrapper(inner, expected_dim=160).to(device)
+                model.model = torch.nn.DataParallel(wrapped)
+            else:
+                model.model = ContextSqueezeWrapper(denoiser, expected_dim=160).to(device)
+            print("[INFO] Wrapped denoiser with ContextSqueezeWrapper (squeeze Bx1xK -> BxK)")
+    else:
+        print("[INFO] no_wrap_patch=True: skip ContextSqueezeWrapper")
 
-    if hasattr(model, "model"):
-        den = model.model
-        if isinstance(den, torch.nn.DataParallel):
-            patched = patch_all_cond_encoders(den.module, expected_dim=160)
-        else:
-            patched = patch_all_cond_encoders(den, expected_dim=160)
-        print(f"[INFO] patched cond_encoder count = {patched}")
+    if not args.no_wrap_patch:
+        if hasattr(model, "model"):
+            den = model.model
+            if isinstance(den, torch.nn.DataParallel):
+                patched = patch_all_cond_encoders(den.module, expected_dim=160)
+            else:
+                patched = patch_all_cond_encoders(den, expected_dim=160)
+            print(f"[INFO] patched cond_encoder count = {patched}")
+    else:
+        print("[INFO] no_wrap_patch=True: skip patch_all_cond_encoders")
 
     n_cases = min(args.n_cases, len(dataset))
+
+    best_start = []
+    best_goal = []
+    best_grasp = []
+    best_succ_all3 = []
+
+    # NEW: smoothness stats (best_by_grasp sample)
+    best_uav_a = []
+    best_uav_j = []
+    best_yaw_a = []
+    best_arm_a = []
+
     for idx in range(n_cases):
         data_sample = dataset[idx]
 
-        data_cpu = {}
-        for k, v in data_sample.items():
-            data_cpu[k] = v.detach().cpu() if torch.is_tensor(v) else v
-
+        data_cpu = {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in data_sample.items()}
         for k, v in list(data_sample.items()):
             if torch.is_tensor(v):
                 data_sample[k] = v.to(device)
 
-        q_start = data_sample["q_start"]     # (9,)
-        q_goal = data_sample["q_goal"]       # (9,)
-        q_grasp_xyz = data_sample["q_grasp"] # (3,)
-        traj_gt = data_sample["traj"]        # (H,9)
+        q_start = data_sample["q_start"]       # (9,)
+        q_goal = data_sample["q_goal"]         # (9,)
+        q_grasp_xyz = data_sample["q_grasp"]   # (3,)
 
-        if idx == 0:
-            print("[DEBUG] traj shape:", tuple(traj_gt.shape))
-            print("[DEBUG] traj[0]  :", traj_gt[0].detach().cpu().numpy())
-            print("[DEBUG] traj[-1] :", traj_gt[-1].detach().cpu().numpy())
-            print("[DEBUG] q_start :", q_start.detach().cpu().numpy())
-            print("[DEBUG] q_grasp :", q_grasp_xyz.detach().cpu().numpy())
-            print("[DEBUG] q_goal  :", q_goal.detach().cpu().numpy())
-
-        ee_pos_gt = data_sample.get("ee_positions", None)
-        if ee_pos_gt is None:
-            raise KeyError("Missing 'ee_positions' in data_sample. Dataset must load it from npz.")
-
-        ee_pos_gt_np = ee_pos_gt.detach().cpu().numpy() if torch.is_tensor(ee_pos_gt) else np.asarray(ee_pos_gt)
-        q_grasp_np = q_grasp_xyz.detach().cpu().numpy() if torch.is_tensor(q_grasp_xyz) else np.asarray(q_grasp_xyz)
-
-        dists = np.linalg.norm(ee_pos_gt_np - q_grasp_np[None, :], axis=1)
-        gt_ee_min_err = float(dists.min())
-        gt_best_t = int(dists.argmin())
-        print(f"[GT FK] ee_min_err={gt_ee_min_err:.4f} at t*=58 / T={len(dists)}")
+        q_start_np = q_start.detach().cpu().numpy()
+        q_goal_np = q_goal.detach().cpu().numpy()
+        q_grasp_np = q_grasp_xyz.detach().cpu().numpy()
 
         # =================== context ===================
         context_d = dataset.build_context(data_sample=data_sample)
         adapt_qs_normalized(context_d, QS_DIM_EXPECTED, idx)
-
-        if idx == 0:
-            print("[CTX_KEYS]", {k: (tuple(v.shape) if torch.is_tensor(v) else type(v)) for k, v in context_d.items()})
-            print("[DEBUG context shapes BEFORE]", {k: tuple(v.shape) for k, v in context_d.items() if torch.is_tensor(v)})
+        apply_ctx_mode_to_context(context_d, args.ctx_mode, idx=idx)
 
         for k, v in list(context_d.items()):
             if torch.is_tensor(v) and v.ndim == 3 and v.shape[1] == 1:
                 context_d[k] = v.squeeze(1)
 
-        if idx == 0:
-            print("[DEBUG context shapes AFTER ]", {k: tuple(v.shape) for k, v in context_d.items() if torch.is_tensor(v)})
+        # =================== sampling config ===================
+        if args.mode == "free":
+            hard_conds = {}
+            t_g_list = [None]
+            per_tg = args.n_samples
 
-        # =================== tg-scan + mid hard_conds ===================
-        t_g_list = [24, 40, 56, 72, 88, 104, 120]
-        t_g_list = [t for t in t_g_list if 1 <= t <= H - 2]
-        per_tg = max(5, int(np.ceil(args.n_samples / max(1, len(t_g_list)))))
+        elif args.mode == "endpoints_hard":
+            q_start_hc_1d = normalize_state9_to_1d(
+                dataset,
+                torch.as_tensor(q_start_np, device=device, dtype=torch.float32).unsqueeze(0),
+                name="q_start_hc"
+            )
+            q_goal_hc_1d = normalize_state9_to_1d(
+                dataset,
+                torch.as_tensor(q_goal_np, device=device, dtype=torch.float32).unsqueeze(0),
+                name="q_goal_hc"
+            )
+            hard_conds = {0: q_start_hc_1d, H - 1: q_goal_hc_1d}
+            t_g_list = [None]
+            per_tg = args.n_samples
 
-        # =================== hard_conds: PASS 1D (9,) ONLY ===================
-        q_start_hc_1d = normalize_state9_to_1d(
-            dataset,
-            torch.as_tensor(q_start.detach().cpu().numpy(), device=device, dtype=torch.float32).unsqueeze(0),
-            name="q_start_hc"
-        )
-        q_goal_hc_1d = normalize_state9_to_1d(
-            dataset,
-            torch.as_tensor(q_goal.detach().cpu().numpy(), device=device, dtype=torch.float32).unsqueeze(0),
-            name="q_goal_hc"
-        )
+        else:
+            q_start_hc_1d = normalize_state9_to_1d(
+                dataset,
+                torch.as_tensor(q_start_np, device=device, dtype=torch.float32).unsqueeze(0),
+                name="q_start_hc"
+            )
+            q_goal_hc_1d = normalize_state9_to_1d(
+                dataset,
+                torch.as_tensor(q_goal_np, device=device, dtype=torch.float32).unsqueeze(0),
+                name="q_goal_hc"
+            )
 
-        # IK solve q_g in 9D (pinocchio)
-        q_init_np = q_start.detach().cpu().numpy()
-        q_g_np, _ = ik_solve_pos_dls(
-            _model_fk, _data_fk, _fid,
-            q_init=q_init_np,
-            p_target=q_grasp_np,
-            iters=400,
-            tol=2e-2,
-            step=0.5,
-            lam=1e-2,
-            verbose=False,
-        )
-        ee_qg, _ = fk_xyz_and_jac_pos(q_g_np)
-        print(f"[IK_CHECK] ||FK(q_g)-grasp|| = {float(np.linalg.norm(ee_qg - q_grasp_np)):.6f} m | nq={_model_fk.nq} nv={_model_fk.nv}")
+            q_init_np = q_start_np
+            q_g_np, _ = ik_solve_pos_dls(
+                _model_fk, _data_fk, _fid,
+                q_init=q_init_np,
+                p_target=q_grasp_np,
+                iters=400,
+                tol=2e-2,
+                step=0.5,
+                lam=1e-2,
+                verbose=False,
+            )
+            q_g_hc_1d = normalize_state9_to_1d(
+                dataset,
+                torch.as_tensor(q_g_np, device=device, dtype=torch.float32).unsqueeze(0),
+                name="q_g_hc"
+            )
 
-        q_g_hc_1d = normalize_state9_to_1d(
-            dataset,
-            torch.as_tensor(q_g_np, device=device, dtype=torch.float32).unsqueeze(0),
-            name="q_g_hc"
-        )
+            if args.tg_scan:
+                t_g_list = [24, 40, 56, 72, 88, 104, 120]
+                t_g_list = [t for t in t_g_list if 1 <= t <= H - 2]
+            else:
+                t_g_list = [int(max(1, min(H - 2, args.t_g)))]
+            per_tg = max(1, int(np.ceil(args.n_samples / max(1, len(t_g_list)))))
 
+            hard_conds = {}
+
+        # =================== run inference ===================
         all_cp_norm = []
-        all_tag_tg = []
+        all_tag = []
 
         for t_g in t_g_list:
-            # IMPORTANT: hard_conds values are 1D (9,), NOT (B,9)
-            hard_conds = {0: q_start_hc_1d, H - 1: q_goal_hc_1d, t_g: q_g_hc_1d}
+            if args.mode == "endpoints_and_mid_hard":
+                hard_conds_t = {0: q_start_hc_1d, H - 1: q_goal_hc_1d, int(t_g): q_g_hc_1d}
+            else:
+                hard_conds_t = hard_conds if hard_conds is not None else {}
 
-            # context is batched to per_tg, and n_samples=per_tg
+            if hard_conds_t is None:
+                hard_conds_t = {}
+
             context_d_tg = {}
             for k, v in context_d.items():
                 if torch.is_tensor(v):
@@ -577,76 +779,167 @@ def main():
                 else:
                     context_d_tg[k] = v
 
-            if idx == 0 and t_g == t_g_list[0]:
-                print("[TG_DEBUG_FINAL] shapes:",
-                      {k: tuple(v.shape) for k, v in context_d_tg.items() if torch.is_tensor(v)})
-                print("[HC_DEBUG] hard_conds shapes:",
-                      {kk: tuple(vv.shape) for kk, vv in hard_conds.items()})
-
             cp_norm_tg = model.run_inference(
                 context_d=context_d_tg,
-                hard_conds=hard_conds,
+                hard_conds=hard_conds_t,
                 n_samples=per_tg,
                 horizon=H,
             )
-
-            if idx == 0 and t_g == t_g_list[0]:
-                print("[DEBUG] cp_norm_tg shape =", tuple(cp_norm_tg.shape))
-
             all_cp_norm.append(cp_norm_tg)
-            all_tag_tg.append(torch.full((cp_norm_tg.shape[0],), t_g, device="cpu", dtype=torch.int64))
+            all_tag.append(torch.full((cp_norm_tg.shape[0],), -1 if t_g is None else int(t_g),
+                                      device="cpu", dtype=torch.int64))
 
         cp_norm = torch.cat(all_cp_norm, dim=0)
-        tag_tg = torch.cat(all_tag_tg, dim=0)
+        tag_tg = torch.cat(all_tag, dim=0)
 
         cp = dataset.unnormalize_control_points(cp_norm)
-        print("[DEBUG] cp shape after unnormalize =", tuple(cp.shape))
 
-        # 5D -> 9D conversion for FK eval if needed
         if cp.shape[-1] == 5:
             cp5_np = cp.detach().cpu().numpy()
-            q_start9_np = q_start.detach().cpu().numpy()
-            q_goal9_np  = q_goal.detach().cpu().numpy()
             cp9_np = np.stack(
-                [traj5_to_traj9(cp5_np[i], q_start9_np, q_goal9_np) for i in range(cp5_np.shape[0])],
+                [traj5_to_traj9(cp5_np[i], q_start_np, q_goal_np) for i in range(cp5_np.shape[0])],
                 axis=0
             )
             cp = torch.as_tensor(cp9_np, device=cp.device, dtype=torch.float32)
-            print("[DEBUG] cp converted 5D->9D:", tuple(cp.shape))
         elif cp.shape[-1] != 9:
             raise ValueError(f"[ERR] Unexpected cp last-dim={cp.shape[-1]} with shape={tuple(cp.shape)}")
 
-        # clamp endpoints
-        cp[:, 0, :] = q_start[None, :]
-        cp[:, -1, :] = q_goal[None, :]
-
         cp_np = cp.detach().cpu().numpy()
-        pred_fk_errs = np.asarray([fk_min_grasp_err_from_traj9(cp_np[s], q_grasp_np) for s in range(cp_np.shape[0])],
-                                  dtype=np.float64)
 
-        pred_best = float(pred_fk_errs.min())
-        pred_mean = float(pred_fk_errs.mean())
-        pred_succ2 = float((pred_fk_errs < 0.02).mean())
+        start_pos_gt = np.asarray(q_start_np[:3], dtype=np.float64)
+        goal_pos_gt = np.asarray(q_goal_np[:3], dtype=np.float64)
 
-        best_idx = int(pred_fk_errs.argmin())
-        print(f"[TG_SCAN] best from t_g={int(tag_tg[best_idx])} | best_err={pred_best:.4f} m")
-        print(f"[PRED FK] best_ee_min_err={pred_best:.4f} m | mean={pred_mean:.4f} m | succ@2cm={pred_succ2:.3f}")
+        # ------------------- sanity debug for endpoints/coords -------------------
+        if args.dbg_eval and idx == 0:
+            xyz = cp_np[:, :, :3]  # (S,H,3)
+            xyz_min = xyz.min(axis=(0, 1))
+            xyz_max = xyz.max(axis=(0, 1))
+            print("[DBG_EVAL] start_xyz(gt):", start_pos_gt)
+            print("[DBG_EVAL] goal_xyz (gt):", goal_pos_gt)
+            print("[DBG_EVAL] pred_xyz range: min", xyz_min, "max", xyz_max)
+            for s_show in [0, min(1, cp_np.shape[0]-1)]:
+                p0 = cp_np[s_show, 0, :3]
+                pT = cp_np[s_show, -1, :3]
+                print(f"[DBG_EVAL] sample{s_show:02d} traj0_xyz={p0} trajT_xyz={pT} "
+                      f"|e0|={np.linalg.norm(p0-start_pos_gt):.4f} |eT|={np.linalg.norm(pT-goal_pos_gt):.4f}")
+        # -----------------------------------------------------------------------
 
-        # save one case and exit (since n_cases=1 in your cmd)
+        # ---- errors + smoothness per sample ----
+        S = cp_np.shape[0]
+        start_errs = np.zeros((S,), dtype=np.float64)
+        goal_errs  = np.zeros((S,), dtype=np.float64)
+        grasp_errs = np.zeros((S,), dtype=np.float64)
+
+        # smoothness arrays (store key ones; you can add more later)
+        uav_a_mean = np.zeros((S,), dtype=np.float64)
+        uav_j_mean = np.zeros((S,), dtype=np.float64)
+        yaw_a_mean = np.zeros((S,), dtype=np.float64)
+        arm_a_mean = np.zeros((S,), dtype=np.float64)
+
+        for s in range(S):
+            start_pos_pred = np.asarray(cp_np[s, 0, :3], dtype=np.float64)
+            goal_pos_pred  = np.asarray(cp_np[s, -1, :3], dtype=np.float64)
+            start_errs[s] = float(np.linalg.norm(start_pos_pred - start_pos_gt))
+            goal_errs[s]  = float(np.linalg.norm(goal_pos_pred - goal_pos_gt))
+            grasp_errs[s] = fk_min_grasp_err_from_traj9(cp_np[s], q_grasp_np)
+
+            sm = compute_smooth_metrics_traj9(cp_np[s])
+            uav_a_mean[s] = sm["uav_a_mean"]
+            uav_j_mean[s] = sm["uav_j_mean"]
+            yaw_a_mean[s] = sm["yaw_a_mean"]
+            arm_a_mean[s] = sm["arm_a_mean"]
+
+        # pick best by grasp (keep your current selection rule)
+        best_idx = int(np.argmin(grasp_errs))
+        e_start_best = float(start_errs[best_idx])
+        e_goal_best  = float(goal_errs[best_idx])
+        e_grasp_best = float(grasp_errs[best_idx])
+
+        # smoothness of that best sample
+        uav_a_best = float(uav_a_mean[best_idx])
+        uav_j_best = float(uav_j_mean[best_idx])
+        yaw_a_best = float(yaw_a_mean[best_idx])
+        arm_a_best = float(arm_a_mean[best_idx])
+
+        # success@2cm(all3)
+        all3 = (start_errs < args.succ_thresh_m) & (goal_errs < args.succ_thresh_m) & (grasp_errs < args.succ_thresh_m)
+        succ_all3 = float(all3.mean())
+
+        # optional debug for smoothness
+        if args.dbg_smooth and idx == 0:
+            show_ids = [0, min(1, S - 1), best_idx]
+            show_ids = list(dict.fromkeys(show_ids))  # unique keep order
+            for sid in show_ids:
+                sm = compute_smooth_metrics_traj9(cp_np[sid])
+                print(f"[DBG_SMOOTH] sample{sid:02d} "
+                      f"uav_a_mean={sm['uav_a_mean']:.6f} uav_j_mean={sm['uav_j_mean']:.6f} "
+                      f"yaw_a_mean={sm['yaw_a_mean']:.6f} arm_a_mean={sm['arm_a_mean']:.6f}")
+
+        print(
+            f"[CASE {idx:04d}] "
+            f"e_start_uav={e_start_best:.4f} m | "
+            f"e_goal_uav={e_goal_best:.4f} m | "
+            f"e_grasp_ee_min={e_grasp_best:.4f} m | "
+            f"smooth(uav_a={uav_a_best:.6f}, uav_j={uav_j_best:.6f}, yaw_a={yaw_a_best:.6f}, arm_a={arm_a_best:.6f}) | "
+            f"succ@2cm(all3)={succ_all3:.3f}"
+        )
+
+        best_start.append(e_start_best)
+        best_goal.append(e_goal_best)
+        best_grasp.append(e_grasp_best)
+        best_succ_all3.append(succ_all3)
+
+        best_uav_a.append(uav_a_best)
+        best_uav_j.append(uav_j_best)
+        best_yaw_a.append(yaw_a_best)
+        best_arm_a.append(arm_a_best)
+
         out_npz = os.path.join(args.save_dir, f"case_{idx:04d}_samples.npz")
         np.savez(
             out_npz,
             cp=cp_np,
-            traj_gt=data_cpu["traj"].numpy() if torch.is_tensor(data_cpu["traj"]) else np.array(data_cpu["traj"]),
             q_start=data_cpu["q_start"].numpy(),
             q_goal=data_cpu["q_goal"].numpy(),
             q_grasp=data_cpu["q_grasp"].numpy(),
-            pred_fk_best=np.array([pred_best], dtype=np.float32),
-            pred_fk_mean=np.array([pred_mean], dtype=np.float32),
-            pred_fk_succ2cm=np.array([pred_succ2], dtype=np.float32),
+            best_idx=np.array([best_idx], dtype=np.int64),
+            start_errs=start_errs.astype(np.float32),
+            goal_errs=goal_errs.astype(np.float32),
+            grasp_errs=grasp_errs.astype(np.float32),
+            succ_all3=np.array([succ_all3], dtype=np.float32),
+            # NEW: smoothness arrays per sample
+            uav_a_mean=uav_a_mean.astype(np.float32),
+            uav_j_mean=uav_j_mean.astype(np.float32),
+            yaw_a_mean=yaw_a_mean.astype(np.float32),
+            arm_a_mean=arm_a_mean.astype(np.float32),
+            mode=np.array([args.mode]),
+            ctx_mode=np.array([args.ctx_mode]),
+            seed=np.array([args.seed], dtype=np.int64),
+            no_wrap_patch=np.array([int(args.no_wrap_patch)], dtype=np.int64),
+            t_g_tag=tag_tg.numpy(),
         )
 
-        print(f"[SAVED] {out_npz}")
+    if len(best_start) > 0:
+        s0 = _stats_np(best_start)
+        sg = _stats_np(best_goal)
+        sk = _stats_np(best_grasp)
+        succ = float(np.mean(np.asarray(best_succ_all3, dtype=np.float64)))
+
+        sm_uav_a = _stats_np(best_uav_a)
+        sm_uav_j = _stats_np(best_uav_j)
+        sm_yaw_a = _stats_np(best_yaw_a)
+        sm_arm_a = _stats_np(best_arm_a)
+
+        print("\n[SUMMARY] (best_by_grasp over samples; meters)")
+        print(f"[METRIC] e_start_uav(m):     mean={s0['mean']:.6f}, p50={s0['p50']:.6f}, p90={s0['p90']:.6f}")
+        print(f"[METRIC] e_goal_uav(m):      mean={sg['mean']:.6f}, p50={sg['p50']:.6f}, p90={sg['p90']:.6f}")
+        print(f"[METRIC] e_grasp_ee_min(m):  mean={sk['mean']:.6f}, p50={sk['p50']:.6f}, p90={sk['p90']:.6f}")
+        print(f"[METRIC] succ@2cm(all3): {succ:.4f}")
+
+        print("\n[SUMMARY] (smoothness of best_by_grasp sample; per-step discrete diffs)")
+        print(f"[SMOOTH] uav_a_mean: mean={sm_uav_a['mean']:.6f}, p50={sm_uav_a['p50']:.6f}, p90={sm_uav_a['p90']:.6f}")
+        print(f"[SMOOTH] uav_j_mean: mean={sm_uav_j['mean']:.6f}, p50={sm_uav_j['p50']:.6f}, p90={sm_uav_j['p90']:.6f}")
+        print(f"[SMOOTH] yaw_a_mean: mean={sm_yaw_a['mean']:.6f}, p50={sm_yaw_a['p50']:.6f}, p90={sm_yaw_a['p90']:.6f}")
+        print(f"[SMOOTH] arm_a_mean: mean={sm_arm_a['mean']:.6f}, p50={sm_arm_a['p50']:.6f}, p90={sm_arm_a['p90']:.6f}")
 
 
 if __name__ == "__main__":
