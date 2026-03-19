@@ -25,6 +25,7 @@ from mpd.models.diffusion_models.sample_functions import (
     apply_hard_conditioning,
     ddim_create_time_pairs,
 )
+from mpd.planning.obstacle_guidance import build_ddim_obstacle_kwargs_from_cfg
 from torch_robotics.torch_utils.torch_timer import TimerCUDA
 from torch_robotics.torch_utils.torch_utils import to_numpy, to_torch, clip_grad_by_norm, clip_grad_by_value
 
@@ -244,7 +245,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
     ):
         # Adapted from https://github.com/ezhang7423/language-control-diffusion/blob/63cdafb63d166221549968c662562753f6ac5394/src/lcd/models/diffusion.py#L226
         context_emb = None
-        if context_d is not None:
+        if context_d is not None and self.context_model is not None:
             context_emb = self.context_model(**context_d)
 
         device = self.betas.device
@@ -312,12 +313,25 @@ class GaussianDiffusionModel(nn.Module, ABC):
             if guide is not None and (ddim_sampling_timesteps - k_step) <= t_start_guide:
                 with TimerCUDA() as t_guide:
                     x_start = x.clone()
+                    # 0 at first guided step -> 1 at last guided step
+                    rem_steps = float(ddim_sampling_timesteps - k_step)
+                    if t_start_guide <= 0:
+                        guide_progress = 1.0
+                    else:
+                        guide_progress = 1.0 - (rem_steps / float(t_start_guide))
+                        guide_progress = float(max(0.0, min(1.0, guide_progress)))
                     for k_gd in range(n_guide_steps):
                         grad_prior_weighted = grad_prior * ddim_scale_grad_prior
                         if compute_costs_with_xrecon:
-                            raise NotImplementedError("compute_costs_with_xrecon is not implemented")
+                            # Compute guide on reconstructed x0 (lower-noise manifold) to avoid
+                            # noisy-state guidance causing high-frequency zig-zag.
+                            x_for_guide = self.predict_start_from_noise(x, t=t, noise=grad_prior_weighted)
+                            if self.clip_denoised:
+                                x_for_guide = torch.clamp(x_for_guide, -1.0, 1.0)
+                            x_for_guide = apply_hard_conditioning(x_for_guide, hard_conds)
+                            grad_guide = guide(x_for_guide, context_d=context_d, guide_progress=guide_progress)
                         else:
-                            grad_guide = guide(x, context_d=context_d)
+                            grad_guide = guide(x, context_d=context_d, guide_progress=guide_progress)
 
                         grad_guide_clipped = clip_grad_fn(grad_guide)
                         grad_guide_clipped_weighted = guide_lr * grad_guide_clipped
@@ -367,7 +381,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
         return x, *chains
 
     @torch.no_grad()
-    def conditional_sample(self, hard_conds, horizon=None, batch_size=1, method="ddpm", **sample_kwargs):
+    def conditional_sample(self, hard_conds, horizon=None, batch_size=1, method="ddpm", obstacle_cfg=None, **sample_kwargs):
         """
         hard conditions : hard_conds : { (time, state), ... }
         """
@@ -376,6 +390,16 @@ class GaussianDiffusionModel(nn.Module, ABC):
 
         if method == "ddim":
             assert self.predict_epsilon, "ddim only works with predict_epsilon=True, because of guidance"
+            if obstacle_cfg is not None:
+                obst_kwargs = build_ddim_obstacle_kwargs_from_cfg(
+                    obstacle_cfg=obstacle_cfg,
+                    horizon=horizon,
+                    hard_conds=hard_conds,
+                    device=self.betas.device,
+                )
+                # Keep explicit kwargs precedence to avoid overriding existing call sites.
+                for kk, vv in obst_kwargs.items():
+                    sample_kwargs.setdefault(kk, vv)
             return self.ddim_sample_loop(shape_x, hard_conds, **sample_kwargs)
         elif method == "ddpm":
             return self.p_sample_loop(shape_x, hard_conds, sample_fn=ddpm_sample_fn, **sample_kwargs)
@@ -394,6 +418,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
         n_samples=1,
         return_chain=False,
         return_chain_x_recon=False,
+        obstacle_cfg=None,
         **diffusion_kwargs,
     ):
         # repeat hard conditions and contexts for n_samples
@@ -411,6 +436,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
             batch_size=n_samples,
             return_chain=True,
             return_chain_x_recon=True,
+            obstacle_cfg=obstacle_cfg,
             **diffusion_kwargs,
         )
 
@@ -458,15 +484,24 @@ class GaussianDiffusionModel(nn.Module, ABC):
             context_emb = self.context_model(**context_d)
 
         # diffusion model
-        x_recon = self.model(x_noisy, t, context_emb)
-        x_recon = apply_hard_conditioning(x_recon, hard_conds)
+        eps_pred = self.model(x_noisy, t, context_emb)
+        eps_pred = apply_hard_conditioning(eps_pred, hard_conds)
 
-        assert noise.shape == x_recon.shape
+        assert noise.shape == eps_pred.shape
 
         if self.predict_epsilon:
-            loss, info = self.loss_fn(x_recon, noise)
+            loss, info = self.loss_fn(eps_pred, noise)
+            # --- expose predicted x0 for planner-like losses ---
+            if not isinstance(info, dict):
+                info = {}
+            if self.predict_epsilon:
+                x0_pred = self.predict_start_from_noise(x_noisy, t=t, noise=eps_pred)
+            else:
+                x0_pred = eps_pred
+            x0_pred = apply_hard_conditioning(x0_pred, hard_conds)
+            info["x_recon"] = x0_pred
         else:
-            loss, info = self.loss_fn(x_recon, x_start)
+            loss, info = self.loss_fn(eps_pred, x_start)
 
         return loss, info
 
