@@ -135,33 +135,72 @@ class EagleGraspNPZDataset(Dataset):
         base = os.path.basename(npz_path)
         case_id = int(base.split("_")[1].split(".")[0])
 
-        if case_id not in self.by_case.index:
-            raise KeyError(f"case_id {case_id} not found in summary.csv (file={base})")
-        row = self.by_case.loc[case_id]
-
-        grasp = np.array([row["grasp_x"], row["grasp_y"], row["grasp_z"]], dtype=np.float32)
-        goal_xyz = np.array([row["goal_x"], row["goal_y"], row["goal_z"]], dtype=np.float32)
-
-        dt = float(row["dt"])
-        t_grasp = float(row["to_grasp"])
-
         data = np.load(npz_path, allow_pickle=True)
+        keys = set(data.keys())
 
-        if "states" not in data:
-            raise KeyError(f"'states' missing in {npz_path}. Keys={list(data.keys())}")
-        states = data["states"].astype(np.float32)
+        row = self.by_case.loc[case_id] if case_id in self.by_case.index else None
+
+        def _row_get(k, default):
+            if row is None:
+                return default
+            if k not in row.index:
+                return default
+            v = row[k]
+            if pd.isna(v):
+                return default
+            return v
+
+        if row is not None and all(k in row.index for k in ["grasp_x", "grasp_y", "grasp_z"]):
+            grasp = np.array([_row_get("grasp_x", 0.0), _row_get("grasp_y", 0.0), _row_get("grasp_z", 0.0)], dtype=np.float32)
+        elif "q_grasp_state" in keys:
+            grasp = np.asarray(data["q_grasp_state"], dtype=np.float32).reshape(-1)[:3]
+        elif "q_grasp" in keys:
+            grasp = np.asarray(data["q_grasp"], dtype=np.float32).reshape(-1)[:3]
+        else:
+            grasp = np.zeros(3, dtype=np.float32)
+
+        if row is not None and all(k in row.index for k in ["goal_x", "goal_y", "goal_z"]):
+            goal_xyz = np.array([_row_get("goal_x", 0.0), _row_get("goal_y", 0.0), _row_get("goal_z", 0.0)], dtype=np.float32)
+        elif "q_goal" in keys:
+            goal_xyz = np.asarray(data["q_goal"], dtype=np.float32).reshape(-1)[:3]
+        else:
+            goal_xyz = np.zeros(3, dtype=np.float32)
+
+        dt = float(_row_get("dt", 1.0))
+        t_grasp = float(_row_get("to_grasp", float(np.asarray(data["t_grasp"]).reshape(-1)[0]) if "t_grasp" in keys else 0.0))
+
+        if "states" in keys:
+            states = data["states"].astype(np.float32)
+        elif "traj" in keys:
+            states = np.asarray(data["traj"], dtype=np.float32)
+            if states.ndim != 2 or states.shape[1] < 9:
+                raise KeyError(f"'traj' has invalid shape in {npz_path}: {states.shape}. Keys={list(data.keys())}")
+            states = states[:, :9]
+        else:
+            raise KeyError(f"'states'/'traj' missing in {npz_path}. Keys={list(data.keys())}")
         T_npz = int(states.shape[0])
 
-        if "ee_positions" not in data:
-            raise KeyError(f"'ee_positions' missing in {npz_path}. Keys={list(data.keys())}")
-        ee_positions = data["ee_positions"].astype(np.float32)
+        if "ee_positions" in keys:
+            ee_positions = np.asarray(data["ee_positions"], dtype=np.float32)
+        elif "ee_traj" in keys:
+            ee_positions = np.asarray(data["ee_traj"], dtype=np.float32)
+        elif "traj" in keys:
+            ee_positions = np.asarray(data["traj"], dtype=np.float32)[:, :3]
+        else:
+            raise KeyError(f"'ee_positions'/'ee_traj' missing in {npz_path}. Keys={list(data.keys())}")
+        if ee_positions.ndim != 2 or ee_positions.shape[1] < 3:
+            raise KeyError(f"invalid ee trajectory shape in {npz_path}: {ee_positions.shape}")
+        ee_positions = ee_positions[:, :3].astype(np.float32)
 
         controls = None
         if "controls" in data:
             controls = data["controls"].astype(np.float32)
 
         # grasp index (in resampled H grid)
-        k_grasp_npz = int(round(t_grasp / max(dt, 1e-9)))
+        if ("t_grasp" in keys) and (not np.isfinite(dt) or dt <= 0.0):
+            k_grasp_npz = int(round(float(np.asarray(data["t_grasp"]).reshape(-1)[0])))
+        else:
+            k_grasp_npz = int(round(t_grasp / max(dt, 1e-9)))
         k_grasp_npz = int(np.clip(k_grasp_npz, 0, T_npz - 1))
 
         if T_npz <= 1:
