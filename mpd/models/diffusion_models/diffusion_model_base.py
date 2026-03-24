@@ -231,6 +231,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
         scale_grad_by_one_minus_alpha=False,
         guide=None,
         guide_lr=0.05,
+        guide_lr_sigma_power=1.0,
         n_guide_steps=1,
         max_perturb_x=0.1,
         clip_grad=False,
@@ -272,6 +273,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
 
         chain = [x] if return_chain else None
         chain_x_recon = [x] if return_chain_x_recon else None
+        guide_sigma0 = None
 
         for k_step, (_time, _time_next) in enumerate(time_pairs):
             if _time == _time_next:
@@ -297,22 +299,26 @@ class GaussianDiffusionModel(nn.Module, ABC):
 
             grad_prior = model_out
 
-            def update_x(_x, _grad_prior):
-                _x_recon = self.predict_start_from_noise(_x, t=t, noise=_grad_prior)
+            def update_x(_x, _eps):
+                _x_recon = self.predict_start_from_noise(_x, t=t, noise=_eps)
                 if self.clip_denoised:
-                    _x_recon.clamp_(-1.0, 1.0)
+                    _x_recon = torch.clamp(_x_recon, -1.0, 1.0)
                 else:
-                    assert RuntimeError()
-                _pred_noise = self.predict_noise_from_start(_x, t=t, x0=_grad_prior)
-                _x = _x_recon * alpha_next.sqrt() + c * _pred_noise
-                _x = apply_hard_conditioning(_x, hard_conds)
-                return _x, _x_recon
+                    raise RuntimeError("clip_denoised must be True")
+                _x_next = _x_recon * alpha_next.sqrt() + c * _eps
+                _x_next = apply_hard_conditioning(_x_next, hard_conds)
+                return _x_next, _x_recon
 
             # Modify the noise if guidance is active
             # https://arxiv.org/pdf/2105.05233.pdf - Algorithm 2
             if guide is not None and (ddim_sampling_timesteps - k_step) <= t_start_guide:
                 with TimerCUDA() as t_guide:
                     x_start = x.clone()
+                    sigma_t_scalar = float(torch.mean((1.0 - alpha).sqrt()).item())
+                    if guide_sigma0 is None:
+                        guide_sigma0 = max(sigma_t_scalar, 1e-8)
+                    sigma_ratio = max(sigma_t_scalar / max(guide_sigma0, 1e-8), 1e-8)
+                    step_scale = float(sigma_ratio ** float(guide_lr_sigma_power))
                     # 0 at first guided step -> 1 at last guided step
                     rem_steps = float(ddim_sampling_timesteps - k_step)
                     if t_start_guide <= 0:
@@ -329,12 +335,22 @@ class GaussianDiffusionModel(nn.Module, ABC):
                             if self.clip_denoised:
                                 x_for_guide = torch.clamp(x_for_guide, -1.0, 1.0)
                             x_for_guide = apply_hard_conditioning(x_for_guide, hard_conds)
-                            grad_guide = guide(x_for_guide, context_d=context_d, guide_progress=guide_progress)
+                            grad_guide = guide(
+                                x_for_guide,
+                                context_d=context_d,
+                                guide_progress=guide_progress,
+                                sigma_ratio=sigma_ratio,
+                            )
                         else:
-                            grad_guide = guide(x, context_d=context_d, guide_progress=guide_progress)
+                            grad_guide = guide(
+                                x,
+                                context_d=context_d,
+                                guide_progress=guide_progress,
+                                sigma_ratio=sigma_ratio,
+                            )
 
                         grad_guide_clipped = clip_grad_fn(grad_guide)
-                        grad_guide_clipped_weighted = guide_lr * grad_guide_clipped
+                        grad_guide_clipped_weighted = (guide_lr * step_scale) * grad_guide_clipped
 
                         # grad_prior_weighted_norm = torch.linalg.norm(grad_prior_weighted, dim=-1)
                         # grad_guide_clipped_weighted_norm = torch.linalg.norm(grad_guide_clipped_weighted, dim=-1)

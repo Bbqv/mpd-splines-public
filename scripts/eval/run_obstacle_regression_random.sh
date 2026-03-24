@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+OBST_PRESET="${OBST_PRESET:-scripts/eval/obstacle_preset.json}"
 MASTER_CKPT="${MASTER_CKPT:-checkpoints_frozen/0313_220238/base_44k.pth}"
 DATA_ROOT="${DATA_ROOT:-/home/yongxin/wpj/dataset_room_4x4x2_relaxed_mpd}"
 DEVICE="${DEVICE:-cuda}"
@@ -11,16 +12,76 @@ N_CASES="${N_CASES:-10}"
 N_SAMPLES="${N_SAMPLES:-64}"
 SEEDS="${SEEDS:-0 1 2}"
 
-RANDOM_N="${RANDOM_N:-2}"
+RANDOM_N_EXPLICIT=0
+if [[ -n "${RANDOM_N+x}" ]]; then
+  RANDOM_N_EXPLICIT=1
+fi
+RANDOM_BOX_N_EXPLICIT=0
+if [[ -n "${RANDOM_BOX_N+x}" ]]; then
+  RANDOM_BOX_N_EXPLICIT=1
+fi
+
+RANDOM_N="${RANDOM_N:-12}"
 RANDOM_XYZ_MIN="${RANDOM_XYZ_MIN:--0.40,-0.40,0.80}"
 RANDOM_XYZ_MAX="${RANDOM_XYZ_MAX:-0.40,0.40,1.80}"
-RANDOM_R_MIN="${RANDOM_R_MIN:-0.12}"
-RANDOM_R_MAX="${RANDOM_R_MAX:-0.24}"
-RANDOM_ANCHOR_CLEARANCE="${RANDOM_ANCHOR_CLEARANCE:-0.0}"
-RANDOM_AVOID_OVERLAP="${RANDOM_AVOID_OVERLAP:-0}"
-RANDOM_OVERLAP_MARGIN="${RANDOM_OVERLAP_MARGIN:-0.0}"
+RANDOM_R_MIN="${RANDOM_R_MIN:-0.06}"
+RANDOM_R_MAX="${RANDOM_R_MAX:-0.18}"
+RANDOM_ANCHOR_CLEARANCE="${RANDOM_ANCHOR_CLEARANCE:-0.15}"
+RANDOM_AVOID_OVERLAP="${RANDOM_AVOID_OVERLAP:-1}"
+RANDOM_BOX_AVOID_OVERLAP="${RANDOM_BOX_AVOID_OVERLAP:-$RANDOM_AVOID_OVERLAP}"
+RANDOM_OVERLAP_MARGIN="${RANDOM_OVERLAP_MARGIN:-0.01}"
+RANDOM_SAMPLING_MODE="${RANDOM_SAMPLING_MODE:-stratified}"
+RANDOM_RADIUS_MODE="${RANDOM_RADIUS_MODE:-mixed}"
+RANDOM_CENTER_MIN_DIST="${RANDOM_CENTER_MIN_DIST:-0.20}"
+RANDOM_MAX_TRIES="${RANDOM_MAX_TRIES:-10000}"
+SCENE_BOUNDS_MODE="${SCENE_BOUNDS_MODE:-mix}"
+SCENE_PAD_XY="${SCENE_PAD_XY:-0.7}"
+SCENE_PAD_Z="${SCENE_PAD_Z:-0.4}"
+SCENE_MIX_GLOBAL_RATIO="${SCENE_MIX_GLOBAL_RATIO:-0.9}"
+GLOBAL_BOUNDS_MODE="${GLOBAL_BOUNDS_MODE:-auto}"
+GLOBAL_PAD_XY="${GLOBAL_PAD_XY:-1.0}"
+GLOBAL_PAD_Z="${GLOBAL_PAD_Z:-0.6}"
+WORKSPACE_MIN="${WORKSPACE_MIN:-}"
+WORKSPACE_MAX="${WORKSPACE_MAX:-}"
+RANDOM_BOX_ENABLE="${RANDOM_BOX_ENABLE:-1}"
+RANDOM_BOX_N="${RANDOM_BOX_N:-12}"
+RANDOM_N_MIN="${RANDOM_N_MIN:-0}"
+RANDOM_N_MAX="${RANDOM_N_MAX:-256}"
+RANDOM_BOX_N_MIN="${RANDOM_BOX_N_MIN:-0}"
+RANDOM_BOX_N_MAX="${RANDOM_BOX_N_MAX:-256}"
+DENSITY_SPH_PER_M3="${DENSITY_SPH_PER_M3:-0}"
+DENSITY_BOX_PER_M3="${DENSITY_BOX_PER_M3:-0}"
+RANDOM_BOX_HALF_MIN="${RANDOM_BOX_HALF_MIN:-0.04,0.04,0.05}"
+RANDOM_BOX_HALF_MAX="${RANDOM_BOX_HALF_MAX:-0.10,0.10,0.18}"
+RANDOM_BOX_MAX_TRIES="${RANDOM_BOX_MAX_TRIES:-10000}"
+RANDOM_BOX_SAMPLING_MODE="${RANDOM_BOX_SAMPLING_MODE:-stratified}"
+RANDOM_BOX_SIZE_MODE="${RANDOM_BOX_SIZE_MODE:-mixed}"
+RANDOM_BOX_CENTER_MIN_DIST="${RANDOM_BOX_CENTER_MIN_DIST:-0.20}"
+RANDOM_BOX_PROXY_RADIUS_SCALE="${RANDOM_BOX_PROXY_RADIUS_SCALE:-0.65}"
+RANDOM_BOX_PROXY_MIN_RADIUS="${RANDOM_BOX_PROXY_MIN_RADIUS:-0.03}"
+RANDOM_BOX_PROXY_MAX_PER_BOX="${RANDOM_BOX_PROXY_MAX_PER_BOX:-2}"
+ANCHOR_CLEARANCE_THR="${ANCHOR_CLEARANCE_THR:-0.03}"
+ANCHOR_RESAMPLE_MAX="${ANCHOR_RESAMPLE_MAX:-50}"
+DISABLE_ANCHOR_RESAMPLE="${DISABLE_ANCHOR_RESAMPLE:-0}"
 
 STRICT="${STRICT:-1}"
+STRICT_CLR_MIN="${STRICT_CLR_MIN:-0.03}"
+SELECT_MIN_CLEARANCE="${SELECT_MIN_CLEARANCE:-0.03}"
+SAFE_MARGIN="${SAFE_MARGIN:-0.05}"
+SELECT_W_GRASP="${SELECT_W_GRASP:-1.0}"
+SELECT_W_UAV_J="${SELECT_W_UAV_J:-0.3}"
+SELECT_W_UAV_A="${SELECT_W_UAV_A:-0.1}"
+SELECT_W_PATH_LEN="${SELECT_W_PATH_LEN:-0.6}"
+SELECT_W_TURN="${SELECT_W_TURN:-0.25}"
+SELECT_W_STRAIGHT="${SELECT_W_STRAIGHT:-0.15}"
+SELECT_MAX_PATH_LEN_RATIO="${SELECT_MAX_PATH_LEN_RATIO:-2.6}"
+PROJ_W_LEN="${PROJ_W_LEN:-20.0}"
+PROJ_W_REF="${PROJ_W_REF:-10.0}"
+PROJ_W_LEN_RATIO="${PROJ_W_LEN_RATIO:-12.0}"
+PROJ_MAX_LEN_RATIO="${PROJ_MAX_LEN_RATIO:-2.0}"
+PROJ_W_UAV_TURN="${PROJ_W_UAV_TURN:-40.0}"
+PROJ_TURN_THETA_MAX_DEG="${PROJ_TURN_THETA_MAX_DEG:-35.0}"
+PROJ_W_UAV_CURV="${PROJ_W_UAV_CURV:-20.0}"
 
 OUTS=()
 
@@ -34,37 +95,100 @@ for SEED in $SEEDS; do
     python -u scripts/eval/eval_eagle_grasp.py
     --dataset_file_merged "$DATA_ROOT"
     --ckpt "$MASTER_CKPT" --device "$DEVICE"
+    --obst_preset "$OBST_PRESET"
     --n_cases "$N_CASES" --n_samples "$N_SAMPLES"
     --save_dir "$OUT"
     --H 144 --mode endpoints_and_mid_hard --ctx_mode orig --t_g 72 --seed "$SEED"
     --obst_enable
-    --obst_random_enable --obst_random_n "$RANDOM_N"
+    --obst_random_enable
+    --obst_random_n_min "$RANDOM_N_MIN"
+    --obst_random_n_max "$RANDOM_N_MAX"
+    --obst_density_sph_per_m3 "$DENSITY_SPH_PER_M3"
+    --obst_scene_bounds_mode "$SCENE_BOUNDS_MODE"
+    --obst_scene_pad_xy "$SCENE_PAD_XY"
+    --obst_scene_pad_z "$SCENE_PAD_Z"
+    --obst_scene_mix_global_ratio "$SCENE_MIX_GLOBAL_RATIO"
+    --obst_global_bounds_mode "$GLOBAL_BOUNDS_MODE"
+    --obst_global_pad_xy "$GLOBAL_PAD_XY"
+    --obst_global_pad_z "$GLOBAL_PAD_Z"
+    --obst_random_avoid_overlap "$RANDOM_AVOID_OVERLAP"
+    --obst_random_box_avoid_overlap "$RANDOM_BOX_AVOID_OVERLAP"
     --obst_random_xyz_min="$RANDOM_XYZ_MIN"
     --obst_random_xyz_max="$RANDOM_XYZ_MAX"
     --obst_random_r_min "$RANDOM_R_MIN" --obst_random_r_max "$RANDOM_R_MAX"
     --obst_random_anchor_clearance "$RANDOM_ANCHOR_CLEARANCE"
+    --obst_anchor_clearance_thr "$ANCHOR_CLEARANCE_THR"
+    --obst_anchor_resample_max "$ANCHOR_RESAMPLE_MAX"
     --obst_random_overlap_margin "$RANDOM_OVERLAP_MARGIN"
+    --obst_random_max_tries "$RANDOM_MAX_TRIES"
+    --obst_random_sampling_mode "$RANDOM_SAMPLING_MODE"
+    --obst_random_radius_mode "$RANDOM_RADIUS_MODE"
+    --obst_random_center_min_dist "$RANDOM_CENTER_MIN_DIST"
+    --obst_random_boxes_n_min "$RANDOM_BOX_N_MIN"
+    --obst_random_boxes_n_max "$RANDOM_BOX_N_MAX"
+    --obst_density_box_per_m3 "$DENSITY_BOX_PER_M3"
+    --obst_random_box_half_min="$RANDOM_BOX_HALF_MIN"
+    --obst_random_box_half_max="$RANDOM_BOX_HALF_MAX"
+    --obst_random_box_max_tries "$RANDOM_BOX_MAX_TRIES"
+    --obst_random_box_sampling_mode "$RANDOM_BOX_SAMPLING_MODE"
+    --obst_random_box_size_mode "$RANDOM_BOX_SIZE_MODE"
+    --obst_random_box_center_min_dist "$RANDOM_BOX_CENTER_MIN_DIST"
+    --obst_random_box_proxy_radius_scale "$RANDOM_BOX_PROXY_RADIUS_SCALE"
+    --obst_random_box_proxy_min_radius "$RANDOM_BOX_PROXY_MIN_RADIUS"
+    --obst_random_box_proxy_max_per_box "$RANDOM_BOX_PROXY_MAX_PER_BOX"
+    --obst_select_min_clearance "$SELECT_MIN_CLEARANCE"
+    --obst_safe_margin "$SAFE_MARGIN"
+    --obst_select_w_grasp "$SELECT_W_GRASP"
+    --obst_select_w_j "$SELECT_W_UAV_J"
+    --obst_select_w_a "$SELECT_W_UAV_A"
+    --obst_select_w_len "$SELECT_W_PATH_LEN"
+    --obst_select_w_turn "$SELECT_W_TURN"
+    --obst_select_w_straight "$SELECT_W_STRAIGHT"
+    --obst_select_max_len_ratio "$SELECT_MAX_PATH_LEN_RATIO"
     --obst_project_enable
     --obst_proj_adaptive_enable
+    --obst_proj_w_len "$PROJ_W_LEN"
+    --obst_proj_w_ref "$PROJ_W_REF"
+    --obst_proj_w_len_ratio "$PROJ_W_LEN_RATIO"
+    --obst_proj_max_len_ratio "$PROJ_MAX_LEN_RATIO"
+    --obst_proj_w_uav_turn "$PROJ_W_UAV_TURN"
+    --obst_proj_turn_theta_max_deg "$PROJ_TURN_THETA_MAX_DEG"
+    --obst_proj_w_uav_curv "$PROJ_W_UAV_CURV"
   )
 
-  if [[ "$RANDOM_AVOID_OVERLAP" == "1" ]]; then
-    CMD+=(--obst_random_avoid_overlap)
+  if [[ -n "$WORKSPACE_MIN" ]]; then
+    CMD+=(--obst_workspace_min="$WORKSPACE_MIN")
+  fi
+  if [[ -n "$WORKSPACE_MAX" ]]; then
+    CMD+=(--obst_workspace_max="$WORKSPACE_MAX")
+  fi
+  if [[ "$DISABLE_ANCHOR_RESAMPLE" == "1" ]]; then
+    CMD+=(--obst_disable_anchor_resample)
+  fi
+  if [[ "$RANDOM_N_EXPLICIT" == "1" ]]; then
+    CMD+=(--obst_random_n "$RANDOM_N")
+  fi
+  if [[ "$RANDOM_BOX_ENABLE" == "1" ]]; then
+    CMD+=(--obst_random_boxes_enable)
+    if [[ "$RANDOM_BOX_N_EXPLICIT" == "1" ]]; then
+      CMD+=(--obst_random_boxes_n "$RANDOM_BOX_N")
+    fi
   fi
 
   "${CMD[@]}" 2>&1 | tee "$OUT/eval.log"
 done
 
-python - "${OUTS[@]}" "$STRICT" <<'PY'
+python - "${OUTS[@]}" "$STRICT" "$STRICT_CLR_MIN" <<'PY'
 import re
 import sys
 import numpy as np
 
-if len(sys.argv) < 3:
-    raise SystemExit("[ERR] expected at least one run dir and STRICT flag")
+if len(sys.argv) < 4:
+    raise SystemExit("[ERR] expected at least one run dir, STRICT flag and STRICT_CLR_MIN")
 
-run_dirs = sys.argv[1:-1]
-strict = int(sys.argv[-1])
+run_dirs = sys.argv[1:-2]
+strict = int(sys.argv[-2])
+strict_clr_min = float(sys.argv[-1])
 
 pat_succ = re.compile(r"\[METRIC\] succ@2cm\(all3\): ([0-9.]+)")
 pat_uj = re.compile(r"\[SMOOTH\] uav_j_mean: mean=([-0-9.eE]+)")
@@ -106,11 +230,11 @@ if strict:
     for d, succ, _, _, clr_min, n_ok, n_all in rows:
         if succ < 1.0:
             raise SystemExit(f"[FAIL] {d}: succ={succ:.4f} < 1.0")
-        if clr_min < 0.0:
-            raise SystemExit(f"[FAIL] {d}: clr_min={clr_min:.6f} < 0")
+        if clr_min < strict_clr_min:
+            raise SystemExit(f"[FAIL] {d}: clr_min={clr_min:.6f} < {strict_clr_min:.6f}")
         if n_ok != n_all:
             raise SystemExit(f"[FAIL] {d}: hard anchors feasible {n_ok}/{n_all}")
-    print("[PASS] strict checks passed")
+    print(f"[PASS] strict checks passed (clr_min >= {strict_clr_min:.6f})")
 PY
 
 echo "[DONE] random obstacle regression completed."
