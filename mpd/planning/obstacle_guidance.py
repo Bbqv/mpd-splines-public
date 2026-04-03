@@ -478,6 +478,52 @@ def _third_diff(x: torch.Tensor) -> torch.Tensor:
     return x[:, 3:, :] - 3.0 * x[:, 2:-1, :] + 3.0 * x[:, 1:-2, :] - x[:, :-3, :]
 
 
+def _clamp_d2_xyz_inplace(
+    xyz_bxhx3: torch.Tensor,
+    hard_mask_bxh: torch.Tensor,
+    d2_max: float,
+    n_sweeps: int = 2,
+    eps: float = 1e-9,
+) -> torch.Tensor:
+    """
+    Hard projection: clamp ||D2 xyz|| <= d2_max by adjusting interior points.
+
+    This is a pragmatic "spike killer" used after gradient-based post-projection.
+    It keeps hard_mask points fixed and iteratively reduces local 2nd-diff spikes.
+    """
+    if xyz_bxhx3 is None:
+        return xyz_bxhx3
+    if float(d2_max) <= 0.0:
+        return xyz_bxhx3
+    if xyz_bxhx3.ndim != 3 or int(xyz_bxhx3.shape[-1]) != 3:
+        return xyz_bxhx3
+
+    B, H, _ = xyz_bxhx3.shape
+    if H < 3:
+        return xyz_bxhx3
+    if (hard_mask_bxh is None) or tuple(hard_mask_bxh.shape[:2]) != (B, H):
+        hard_mask_bxh = torch.zeros((B, H), dtype=torch.bool, device=xyz_bxhx3.device)
+
+    d2_thr = float(d2_max)
+    hm = hard_mask_bxh.to(torch.bool).unsqueeze(-1)  # (B,H,1)
+
+    with torch.no_grad():
+        for _ in range(int(max(1, n_sweeps))):
+            p0 = xyz_bxhx3[:, :-2, :]     # (B,H-2,3)
+            p1 = xyz_bxhx3[:, 1:-1, :]    # (B,H-2,3)
+            p2 = xyz_bxhx3[:, 2:, :]      # (B,H-2,3)
+            d2 = p2 - 2.0 * p1 + p0
+            d2n = torch.linalg.norm(d2, dim=-1).clamp_min(float(eps))  # (B,H-2)
+            scale = torch.clamp(d2_thr / d2n, max=1.0).unsqueeze(-1)   # (B,H-2,1)
+            d2_t = d2 * scale
+            p1_new = 0.5 * (p0 + p2 - d2_t)
+
+            xyz_new = xyz_bxhx3.clone()
+            xyz_new[:, 1:-1, :] = p1_new
+            xyz_bxhx3.copy_(torch.where(hm, xyz_bxhx3, xyz_new))
+    return xyz_bxhx3
+
+
 def _piecewise_ref_xyz(q_start_xyz, q_grasp_xyz, q_goal_xyz, H, t_mid):
     """
     Piecewise linear reference:
@@ -600,6 +646,10 @@ def obstacle_project_batch(
     w_uav_turn: float = 0.0,
     turn_theta_max_deg: float = 35.0,
     w_uav_curv: float = 0.0,
+    w_uav_curv_hard: float = 0.0,
+    uav_curv_d2_max: float = 0.0,
+    uav_curv_d2_clamp: bool = False,
+    uav_curv_d2_clamp_iters: int = 2,
     prog_eps: float = 0.0,
     q_start_xyz: torch.Tensor = None,
     q_grasp_xyz: torch.Tensor = None,
@@ -608,6 +658,8 @@ def obstacle_project_batch(
     cgd_shift_step: float = 0.0,
     max_grad_value: float = 0.1,
     max_delta: float = 0.05,
+    debug_terms: bool = False,
+    verbose_fn=None,
 ) -> torch.Tensor:
     """
     Lightweight post-projection after diffusion guidance:
@@ -616,6 +668,7 @@ def obstacle_project_batch(
           + w_len_ratio*hinge(path_len/straight_len - max_len_ratio)^2
           + w_uav_v||D1 xyz||^2 + w_uav_a||D2 xyz||^2 + w_uav_j||D3 xyz||^2
           + w_uav_curv||D2 xyz||^2 + w_uav_turn*turn_hinge_xy
+          + w_uav_curv_hard*hinge(||D2 xyz|| - uav_curv_d2_max)^2
           + w_uav_line*dist_to_start_goal_line^2 + w_uav_back*backtracking_penalty
           + w_obst*hinge(clearance)^2
       s.t. hard anchor states stay fixed (start/goal/grasp indices).
@@ -661,6 +714,8 @@ def obstacle_project_batch(
         straight_len_t = torch.clamp(straight_len_t, min=1e-6)
 
     B, H, _ = x0.shape
+    debug_terms = bool(debug_terms)
+    printed_terms = False
 
     def _as_bx3(v):
         if v is None:
@@ -692,7 +747,7 @@ def obstacle_project_batch(
             raise ValueError(f"[ERR] t_mid_idx batch mismatch: got {t_mid_idx_t.numel()}, expected {B}")
         t_mid_idx_t = torch.clamp(t_mid_idx_t, min=1, max=max(1, H - 2))
 
-    for _ in range(int(n_iters)):
+    for it in range(int(n_iters)):
         if (float(cgd_shift_step) > 0.0) and (sph4.shape[0] > 0):
             with torch.no_grad():
                 x[..., :3] = _cgd_collision_shift_xyz(
@@ -703,6 +758,11 @@ def obstacle_project_batch(
 
         loss = 0.0
         xyz = x[..., :3]
+        loss_obst = torch.zeros((), dtype=x.dtype, device=x.device)
+        loss_uav_curv = torch.zeros((), dtype=x.dtype, device=x.device)
+        loss_uav_curv_hard = torch.zeros((), dtype=x.dtype, device=x.device)
+        loss_uav_turn = torch.zeros((), dtype=x.dtype, device=x.device)
+        loss_uav_back_term = torch.zeros((), dtype=x.dtype, device=x.device)
         if w_data > 0.0:
             loss = loss + float(w_data) * torch.mean((x - x0) ** 2)
         if w_v > 0.0 and x.shape[1] >= 2:
@@ -726,7 +786,6 @@ def obstacle_project_batch(
             loss = loss + float(w_len_ratio) * torch.mean(pen_ratio * pen_ratio)
 
         if w_obst > 0.0 and len(sph) > 0:
-            loss_obst = 0.0
             for c, r in sph:
                 dist = torch.linalg.norm(xyz - c, dim=-1)
                 clearance = dist - r
@@ -748,6 +807,12 @@ def obstacle_project_batch(
             if w_uav_curv > 0.0:
                 loss_uav_curv = torch.mean(d2_xyz * d2_xyz)
                 loss = loss + float(w_uav_curv) * loss_uav_curv
+            if w_uav_curv_hard > 0.0 and float(uav_curv_d2_max) > 0.0:
+                # Hinge on ||D2 xyz|| to suppress local spikes without over-penalizing gentle curvature.
+                d2n = torch.linalg.norm(d2_xyz, dim=-1)
+                pen = torch.relu(d2n - float(uav_curv_d2_max))
+                loss_uav_curv_hard = torch.mean(pen * pen)
+                loss = loss + float(w_uav_curv_hard) * loss_uav_curv_hard
             if w_uav_j > 0.0 and xyz.shape[1] >= 4:
                 d3_xyz = d2_xyz[:, 1:, :] - d2_xyz[:, :-1, :]
                 loss_uav_j = torch.mean(d3_xyz * d3_xyz)
@@ -792,6 +857,7 @@ def obstacle_project_batch(
                     loss = loss + float(w_uav_line) * loss_line_acc
                 if w_uav_back > 0.0:
                     loss = loss + float(w_uav_back) * loss_back_acc
+                    loss_uav_back_term = loss_back_acc
             else:
                 a = xyz[:, 0:1, :]
                 b = xyz[:, -1:, :]
@@ -812,7 +878,25 @@ def obstacle_project_batch(
                     eps_prog = float(prog_eps)
                     loss_uav_back = torch.mean(torch.relu(eps_prog - ds) ** 2)
                     loss = loss + float(w_uav_back) * loss_uav_back
+                    loss_uav_back_term = loss_uav_back
         # --- end UAV-shape regularization ---
+
+        # Print a one-time loss-term decomposition for sanity checking.
+        if debug_terms and (not printed_terms) and (verbose_fn is not None):
+            try:
+                verbose_fn(
+                    "[OBST_PROJ_TERMS] "
+                    f"it={int(it)} "
+                    f"curv_soft={float(loss_uav_curv.detach().cpu().item()):.6g}*{float(w_uav_curv):.6g} "
+                    f"curv_hard={float(loss_uav_curv_hard.detach().cpu().item()):.6g}*{float(w_uav_curv_hard):.6g}@d2_max={float(uav_curv_d2_max):.6g} "
+                    f"turn={float(loss_uav_turn.detach().cpu().item()):.6g}*{float(w_uav_turn):.6g}@deg={float(turn_theta_max_deg):.3g} "
+                    f"back={float(loss_uav_back_term.detach().cpu().item()):.6g}*{float(w_uav_back):.6g}@eps={float(prog_eps):.6g} "
+                    f"obst={float(loss_obst.detach().cpu().item()):.6g}*{float(w_obst):.6g}@m={float(margin):.6g} "
+                    f"total={float(loss.detach().cpu().item()):.6g}"
+                )
+            except Exception:
+                pass
+            printed_terms = True
 
         loss.backward()
         if max_grad_value > 0.0:
@@ -824,6 +908,15 @@ def obstacle_project_batch(
             if max_delta > 0.0:
                 dx = torch.clamp(x - x0, min=-float(max_delta), max=float(max_delta))
                 x.copy_(x0 + dx)
+            # Optional: hard clamp of ||D2 xyz|| spikes (more direct than hinge penalties).
+            if bool(uav_curv_d2_clamp) and float(uav_curv_d2_max) > 0.0:
+                x[..., :3] = _clamp_d2_xyz_inplace(
+                    x[..., :3],
+                    hard_mask_bxh=hard_mask,
+                    d2_max=float(uav_curv_d2_max),
+                    n_sweeps=int(max(1, uav_curv_d2_clamp_iters)),
+                )
+                x[hard_mask] = x0[hard_mask]
 
     return x.detach()
 
@@ -866,6 +959,10 @@ def apply_obstacle_projection_with_adaptive(
     w_uav_turn = float(proj_cfg.get("w_uav_turn", 40.0))
     turn_theta_max_deg = float(proj_cfg.get("turn_theta_max_deg", 35.0))
     w_uav_curv = float(proj_cfg.get("w_uav_curv", 20.0))
+    w_uav_curv_hard = float(proj_cfg.get("w_uav_curv_hard", 0.0))
+    uav_curv_d2_max = float(proj_cfg.get("uav_curv_d2_max", 0.0))
+    uav_curv_d2_clamp = bool(proj_cfg.get("uav_curv_d2_clamp", False))
+    uav_curv_d2_clamp_iters = int(max(1, proj_cfg.get("uav_curv_d2_clamp_iters", 2)))
     prog_eps = float(proj_cfg.get("prog_eps", 0.0))
     cgd_shift_step = float(proj_cfg.get("cgd_shift_step", 0.0))
     q_start_xyz = proj_cfg.get("q_start_xyz", None)
@@ -874,6 +971,7 @@ def apply_obstacle_projection_with_adaptive(
     t_mid_idx = proj_cfg.get("t_mid_idx", None)
     max_grad = float(proj_cfg.get("max_grad_value", 0.1))
     max_delta = float(proj_cfg.get("max_delta", 0.05))
+    debug_terms = bool(proj_cfg.get("debug_terms", False))
     if verbose_fn is not None and (not bool(proj_cfg.get("_proj_cfg_printed", False))):
         verbose_fn(
             f"[OBST_PROJ_CFG] iters={n_iters} lr={lr} "
@@ -883,8 +981,11 @@ def apply_obstacle_projection_with_adaptive(
             f"w_uav_v={w_uav_v} w_uav_a={w_uav_a} w_uav_j={w_uav_j} "
             f"w_uav_line={w_uav_line} w_uav_back={w_uav_back} "
             f"w_uav_turn={w_uav_turn} turn_theta_max_deg={turn_theta_max_deg} w_uav_curv={w_uav_curv} "
+            f"w_uav_curv_hard={w_uav_curv_hard} uav_curv_d2_max={uav_curv_d2_max} "
             f"prog_eps={prog_eps} "
             f"cgd_shift_step={cgd_shift_step} "
+            f"d2_clamp={int(uav_curv_d2_clamp)} d2_clamp_iters={int(uav_curv_d2_clamp_iters)} "
+            f"debug_terms={int(debug_terms)} "
             f"max_grad={max_grad} max_delta={max_delta}"
         )
         proj_cfg["_proj_cfg_printed"] = True
@@ -915,6 +1016,10 @@ def apply_obstacle_projection_with_adaptive(
         w_uav_turn=w_uav_turn,
         turn_theta_max_deg=turn_theta_max_deg,
         w_uav_curv=w_uav_curv,
+        w_uav_curv_hard=w_uav_curv_hard,
+        uav_curv_d2_max=uav_curv_d2_max,
+        uav_curv_d2_clamp=uav_curv_d2_clamp,
+        uav_curv_d2_clamp_iters=uav_curv_d2_clamp_iters,
         prog_eps=prog_eps,
         q_start_xyz=q_start_xyz,
         q_grasp_xyz=q_grasp_xyz,
@@ -923,6 +1028,8 @@ def apply_obstacle_projection_with_adaptive(
         cgd_shift_step=cgd_shift_step,
         max_grad_value=max_grad,
         max_delta=max_delta,
+        debug_terms=debug_terms,
+        verbose_fn=verbose_fn,
     )
 
     adaptive_enable = bool(proj_cfg.get("adaptive_enable", False))
@@ -986,14 +1093,28 @@ def apply_obstacle_projection_with_adaptive(
             w_uav_turn=w_uav_turn,
             turn_theta_max_deg=turn_theta_max_deg,
             w_uav_curv=w_uav_curv,
+            w_uav_curv_hard=w_uav_curv_hard,
+            uav_curv_d2_max=uav_curv_d2_max,
+            uav_curv_d2_clamp=uav_curv_d2_clamp,
+            uav_curv_d2_clamp_iters=uav_curv_d2_clamp_iters,
             prog_eps=prog_eps,
-            q_start_xyz=q_start_xyz[bad] if torch.is_tensor(q_start_xyz) and q_start_xyz.ndim >= 2 and q_start_xyz.shape[0] == s_count else q_start_xyz,
-            q_grasp_xyz=q_grasp_xyz[bad] if torch.is_tensor(q_grasp_xyz) and q_grasp_xyz.ndim >= 2 and q_grasp_xyz.shape[0] == s_count else q_grasp_xyz,
-            q_goal_xyz=q_goal_xyz[bad] if torch.is_tensor(q_goal_xyz) and q_goal_xyz.ndim >= 2 and q_goal_xyz.shape[0] == s_count else q_goal_xyz,
-            t_mid_idx=t_mid_idx[bad] if torch.is_tensor(t_mid_idx) and t_mid_idx.ndim >= 1 and t_mid_idx.shape[0] == s_count else t_mid_idx,
+            q_start_xyz=q_start_xyz[bad]
+            if torch.is_tensor(q_start_xyz) and q_start_xyz.ndim >= 2 and q_start_xyz.shape[0] == s_count
+            else q_start_xyz,
+            q_grasp_xyz=q_grasp_xyz[bad]
+            if torch.is_tensor(q_grasp_xyz) and q_grasp_xyz.ndim >= 2 and q_grasp_xyz.shape[0] == s_count
+            else q_grasp_xyz,
+            q_goal_xyz=q_goal_xyz[bad]
+            if torch.is_tensor(q_goal_xyz) and q_goal_xyz.ndim >= 2 and q_goal_xyz.shape[0] == s_count
+            else q_goal_xyz,
+            t_mid_idx=t_mid_idx[bad]
+            if torch.is_tensor(t_mid_idx) and t_mid_idx.ndim >= 1 and t_mid_idx.shape[0] == s_count
+            else t_mid_idx,
             cgd_shift_step=cgd_shift_step,
             max_grad_value=max_grad * fac_g,
             max_delta=max_delta * fac_dx,
+            debug_terms=False,
+            verbose_fn=verbose_fn,
         )
         out[bad] = out_bad
 
@@ -1304,6 +1425,12 @@ def make_shortcut_post_proj_cfg(project_cfg=None):
     """
     Build post-shortcut projection config.
     Uses stable defaults and allows optional override from project_cfg["post_proj_cfg"].
+
+    Important: BEST_POST runs after sampling/selection, so it should inherit the core
+    shape-related knobs (curvature/turn/backtracking, max_delta, etc.) from the main
+    project config when available. This avoids the common pitfall: you tune
+    --obst_proj_w_uav_curv_hard / --obst_proj_uav_curv_d2_max but BEST_POST silently
+    keeps its own defaults.
     """
     cfg = {
         "enable": True,
@@ -1320,16 +1447,49 @@ def make_shortcut_post_proj_cfg(project_cfg=None):
         "w_uav_turn": 40.0,
         "turn_theta_max_deg": 35.0,
         "w_uav_curv": 20.0,
+        "w_uav_curv_hard": 0.0,
+        "uav_curv_d2_max": 0.0,
+        "uav_curv_d2_clamp": True,
+        "uav_curv_d2_clamp_iters": 2,
+        "w_uav_line": 0.0,
+        "w_uav_back": 0.0,
+        "prog_eps": 0.0,
+        "cgd_shift_step": 0.0,
         "w_obst": 120.0,
         "margin": 0.05,
         "max_grad_value": 0.03,
         "max_delta": 0.02,
         "adaptive_enable": False,
+        "debug_terms": False,
     }
     if isinstance(project_cfg, dict):
+        # Apply explicit post-proj overrides first (if provided),
+        # then let direct project_cfg keys (typically from CLI) take precedence.
         post = project_cfg.get("post_proj_cfg", None)
         if isinstance(post, dict):
             cfg.update(post)
+
+        # Inherit a small whitelist of knobs from the main projection config.
+        inherit_keys = [
+            "w_uav_turn",
+            "turn_theta_max_deg",
+            "w_uav_curv",
+            "w_uav_curv_hard",
+            "uav_curv_d2_max",
+            "uav_curv_d2_clamp",
+            "uav_curv_d2_clamp_iters",
+            "w_uav_line",
+            "w_uav_back",
+            "prog_eps",
+            "cgd_shift_step",
+            "w_obst",
+            "margin",
+            "max_grad_value",
+            "max_delta",
+        ]
+        for k in inherit_keys:
+            if k in project_cfg:
+                cfg[k] = project_cfg[k]
     # Backward-compatible alias
     if "max_grad" in cfg and "max_grad_value" not in cfg:
         cfg["max_grad_value"] = cfg["max_grad"]

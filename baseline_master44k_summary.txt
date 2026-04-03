@@ -1,0 +1,70 @@
+==== eval_master44k_seed0_0319_141518 ====
+[CASE 0000] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.060831, uav_j=0.104334, yaw_a=0.025057, arm_a=0.017494) | succ@2cm(all3)=1.000
+[CASE 0001] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.024793, uav_j=0.037482, yaw_a=0.015104, arm_a=0.010891) | succ@2cm(all3)=1.000
+[CASE 0002] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.015846, uav_j=0.025980, yaw_a=0.008687, arm_a=0.007613) | succ@2cm(all3)=1.000
+[CASE 0003] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0000 m | smooth(uav_a=0.040525, uav_j=0.069571, yaw_a=0.022035, arm_a=0.011802) | succ@2cm(all3)=1.000
+[CASE 0004] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.054399, uav_j=0.092416, yaw_a=0.019849, arm_a=0.019470) | succ@2cm(all3)=1.000
+[CASE 0005] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.037211, uav_j=0.062918, yaw_a=0.013626, arm_a=0.012861) | succ@2cm(all3)=1.000
+[CASE 0006] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.069154, uav_j=0.118777, yaw_a=0.036376, arm_a=0.024662) | succ@2cm(all3)=1.000
+[CASE 0007] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.038284, uav_j=0.066493, yaw_a=0.013863, arm_a=0.011733) | succ@2cm(all3)=1.000
+[CASE 0008] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.041594, uav_j=0.065754, yaw_a=0.022117, arm_a=0.017038) | succ@2cm(all3)=1.000
+[CASE 0009] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.027107, uav_j=0.043057, yaw_a=0.015821, arm_a=0.012599) | succ@2cm(all3)=1.000
+[METRIC] succ@2cm(all3): 1.0000
+[SMOOTH] uav_a_mean: mean=0.040975, p50=0.039405, p90=0.061664
+[SMOOTH] uav_j_mean: mean=0.068678, p50=0.066124, p90=0.105778
+==== eval_master44k_seed1_0319_141532 ====
+[CASE 0000] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.043182, uav_j=0.072962, yaw_a=0.013770, arm_a=0.012021) | succ@2cm(all3)=1.000
+[CASE 0001] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.025826, uav_j=0.041081, yaw_a=0.011840, arm_a=0.011313) | succ@2cm(all3)=1.000
+[CASE 0002] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.043634, uav_j=0.075292, yaw_a=0.020083, arm_a=0.012479) | succ@2cm(all3)=1.000
+[CASE 0003] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0000 m | smooth(uav_a=0.039663, uav_j=0.067337, yaw_a=0.017502, arm_a=0.012278) | succ@2cm(all3)=1.000
+[CASE 0004] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.061190, uav_j=0.103267, yaw_a=0.032479, arm_a=0.019796) | succ@2cm(all3)=1.000
+[CASE 0005] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.041971, uav_j=0.073181, yaw_a=0.012859, arm_a=0.014326) | succ@2cm(all3)=1.000
+[CASE 0006] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.080494, uav_j=0.138048, yaw_a=0.035562, arm_a=0.026926) | succ@2cm(all3)=1.000
+[CASE 0007] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.037130, uav_j=0.063948, yaw_a=0.010216, arm_a=0.011453) | succ@2cm(all3)=1.000
+[CASE 0008] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.042345, uav_j=0.068312, yaw_a=0.019082, arm_a=0.015340) | succ@2cm(all3)=1.000
+[CASE 0009] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.024023, uav_j=0.036462, yaw_a=0.020299, arm_a=0.016755) | succ@2cm(all3)=1.000
+[METRIC] succ@2cm(all3): 1.0000
+[SMOOTH] uav_a_mean: mean=0.043946, p50=0.042158, p90=0.063121
+[SMOOTH] uav_j_mean: mean=0.073989, p50=0.070637, p90=0.106745
+==== eval_master44k_seed2_0319_141546 ====
+[CASE 0000] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.044623, uav_j=0.078036, yaw_a=0.011709, arm_a=0.010010) | succ@2cm(all3)=1.000
+[CASE 0001] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.028787, uav_j=0.046231, yaw_a=0.018236, arm_a=0.008797) | succ@2cm(all3)=1.000
+[CASE 0002] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.043281, uav_j=0.074320, yaw_a=0.017955, arm_a=0.014101) | succ@2cm(all3)=1.000
+[CASE 0003] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0000 m | smooth(uav_a=0.037010, uav_j=0.062219, yaw_a=0.014220, arm_a=0.013341) | succ@2cm(all3)=1.000
+[CASE 0004] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.053199, uav_j=0.091936, yaw_a=0.020031, arm_a=0.018061) | succ@2cm(all3)=1.000
+[CASE 0005] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.052693, uav_j=0.091382, yaw_a=0.020479, arm_a=0.017314) | succ@2cm(all3)=1.000
+[CASE 0006] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.078081, uav_j=0.132900, yaw_a=0.033073, arm_a=0.027120) | succ@2cm(all3)=1.000
+[CASE 0007] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.046769, uav_j=0.078871, yaw_a=0.018878, arm_a=0.017688) | succ@2cm(all3)=1.000
+[CASE 0008] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.041045, uav_j=0.066523, yaw_a=0.018262, arm_a=0.014605) | succ@2cm(all3)=1.000
+[CASE 0009] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.025371, uav_j=0.037425, yaw_a=0.021153, arm_a=0.013361) | succ@2cm(all3)=1.000
+[METRIC] succ@2cm(all3): 1.0000
+[SMOOTH] uav_a_mean: mean=0.045086, p50=0.043952, p90=0.055687
+[SMOOTH] uav_j_mean: mean=0.075984, p50=0.076178, p90=0.096032
+==== eval_master44k_seed3_0319_141559 ====
+[CASE 0000] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.051440, uav_j=0.087765, yaw_a=0.019390, arm_a=0.013553) | succ@2cm(all3)=1.000
+[CASE 0001] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.028162, uav_j=0.045230, yaw_a=0.016326, arm_a=0.010269) | succ@2cm(all3)=1.000
+[CASE 0002] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.034101, uav_j=0.059218, yaw_a=0.012687, arm_a=0.009253) | succ@2cm(all3)=1.000
+[CASE 0003] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0000 m | smooth(uav_a=0.052049, uav_j=0.088649, yaw_a=0.026231, arm_a=0.017565) | succ@2cm(all3)=1.000
+[CASE 0004] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.052286, uav_j=0.089612, yaw_a=0.020000, arm_a=0.018506) | succ@2cm(all3)=1.000
+[CASE 0005] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.048933, uav_j=0.085386, yaw_a=0.018819, arm_a=0.016192) | succ@2cm(all3)=1.000
+[CASE 0006] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.077297, uav_j=0.132167, yaw_a=0.037712, arm_a=0.023295) | succ@2cm(all3)=1.000
+[CASE 0007] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.040668, uav_j=0.070250, yaw_a=0.013960, arm_a=0.010476) | succ@2cm(all3)=1.000
+[CASE 0008] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.043826, uav_j=0.070719, yaw_a=0.021214, arm_a=0.014287) | succ@2cm(all3)=1.000
+[CASE 0009] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.024644, uav_j=0.037307, yaw_a=0.015460, arm_a=0.015777) | succ@2cm(all3)=1.000
+[METRIC] succ@2cm(all3): 1.0000
+[SMOOTH] uav_a_mean: mean=0.045341, p50=0.046380, p90=0.054787
+[SMOOTH] uav_j_mean: mean=0.076630, p50=0.078052, p90=0.093868
+==== eval_master44k_seed4_0319_141612 ====
+[CASE 0000] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.044874, uav_j=0.077662, yaw_a=0.015201, arm_a=0.011112) | succ@2cm(all3)=1.000
+[CASE 0001] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.020569, uav_j=0.031896, yaw_a=0.010990, arm_a=0.007634) | succ@2cm(all3)=1.000
+[CASE 0002] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.036882, uav_j=0.064652, yaw_a=0.012906, arm_a=0.009548) | succ@2cm(all3)=1.000
+[CASE 0003] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0000 m | smooth(uav_a=0.059618, uav_j=0.102706, yaw_a=0.029705, arm_a=0.027529) | succ@2cm(all3)=1.000
+[CASE 0004] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.056226, uav_j=0.093446, yaw_a=0.027291, arm_a=0.018367) | succ@2cm(all3)=1.000
+[CASE 0005] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.051423, uav_j=0.090186, yaw_a=0.017163, arm_a=0.014551) | succ@2cm(all3)=1.000
+[CASE 0006] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.079929, uav_j=0.135872, yaw_a=0.035764, arm_a=0.027515) | succ@2cm(all3)=1.000
+[CASE 0007] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0001 m | smooth(uav_a=0.042425, uav_j=0.072825, yaw_a=0.018559, arm_a=0.016001) | succ@2cm(all3)=1.000
+[CASE 0008] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0003 m | smooth(uav_a=0.040541, uav_j=0.063375, yaw_a=0.022423, arm_a=0.016331) | succ@2cm(all3)=1.000
+[CASE 0009] e_start_uav=0.0000 m | e_goal_uav=0.0000 m | e_grasp_ee_min=0.0002 m | smooth(uav_a=0.025620, uav_j=0.039159, yaw_a=0.012867, arm_a=0.014965) | succ@2cm(all3)=1.000
+[METRIC] succ@2cm(all3): 1.0000
+[SMOOTH] uav_a_mean: mean=0.045811, p50=0.043650, p90=0.061649
+[SMOOTH] uav_j_mean: mean=0.077178, p50=0.075243, p90=0.106023

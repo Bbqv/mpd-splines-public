@@ -4,13 +4,24 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+PYTHON="${PYTHON:-python}"
+
 OBST_PRESET="${OBST_PRESET:-scripts/eval/obstacle_preset.json}"
 MASTER_CKPT="${MASTER_CKPT:-checkpoints_frozen/0313_220238/base_44k.pth}"
 DATA_ROOT="${DATA_ROOT:-/home/yongxin/wpj/dataset_room_4x4x2_relaxed_mpd}"
 DEVICE="${DEVICE:-cuda}"
 N_CASES="${N_CASES:-10}"
+CASE_START="${CASE_START:-0}"
 N_SAMPLES="${N_SAMPLES:-64}"
 SEEDS="${SEEDS:-0 1 2}"
+
+# New: force a visible avoidance setup with only 4 REAL obstacles.
+OBST_MODE="${OBST_MODE:-corridor_block4}"
+OBST_TOTAL_N="${OBST_TOTAL_N:-4}"
+OBST_SIZE_SCALE="${OBST_SIZE_SCALE:-4.0}"
+OBST_CORRIDOR_RADIUS="${OBST_CORRIDOR_RADIUS:-0.4}"
+OBST_CORRIDOR_RESAMPLE_MAX="${OBST_CORRIDOR_RESAMPLE_MAX:-50}"
+OBST_EFFECT_CHECK="${OBST_EFFECT_CHECK:-0}"
 
 RANDOM_N_EXPLICIT=0
 if [[ -n "${RANDOM_N+x}" ]]; then
@@ -21,7 +32,8 @@ if [[ -n "${RANDOM_BOX_N+x}" ]]; then
   RANDOM_BOX_N_EXPLICIT=1
 fi
 
-RANDOM_N="${RANDOM_N:-12}"
+# Keep random budget small by default; corridor_block4 will override to exactly total_n anyway.
+RANDOM_N="${RANDOM_N:-4}"
 RANDOM_XYZ_MIN="${RANDOM_XYZ_MIN:--0.40,-0.40,0.80}"
 RANDOM_XYZ_MAX="${RANDOM_XYZ_MAX:-0.40,0.40,1.80}"
 RANDOM_R_MIN="${RANDOM_R_MIN:-0.06}"
@@ -43,8 +55,9 @@ GLOBAL_PAD_XY="${GLOBAL_PAD_XY:-1.0}"
 GLOBAL_PAD_Z="${GLOBAL_PAD_Z:-0.6}"
 WORKSPACE_MIN="${WORKSPACE_MIN:-}"
 WORKSPACE_MAX="${WORKSPACE_MAX:-}"
-RANDOM_BOX_ENABLE="${RANDOM_BOX_ENABLE:-1}"
-RANDOM_BOX_N="${RANDOM_BOX_N:-12}"
+# Default: disable boxes so REAL obstacle count stays exactly 4.
+RANDOM_BOX_ENABLE="${RANDOM_BOX_ENABLE:-0}"
+RANDOM_BOX_N="${RANDOM_BOX_N:-0}"
 RANDOM_N_MIN="${RANDOM_N_MIN:-0}"
 RANDOM_N_MAX="${RANDOM_N_MAX:-256}"
 RANDOM_BOX_N_MIN="${RANDOM_BOX_N_MIN:-0}"
@@ -79,9 +92,19 @@ PROJ_W_LEN="${PROJ_W_LEN:-20.0}"
 PROJ_W_REF="${PROJ_W_REF:-10.0}"
 PROJ_W_LEN_RATIO="${PROJ_W_LEN_RATIO:-12.0}"
 PROJ_MAX_LEN_RATIO="${PROJ_MAX_LEN_RATIO:-2.0}"
-PROJ_W_UAV_TURN="${PROJ_W_UAV_TURN:-40.0}"
-PROJ_TURN_THETA_MAX_DEG="${PROJ_TURN_THETA_MAX_DEG:-35.0}"
-PROJ_W_UAV_CURV="${PROJ_W_UAV_CURV:-20.0}"
+PROJ_W_DATA="${PROJ_W_DATA:-0.05}"
+PROJ_W_V="${PROJ_W_V:-50.0}"
+PROJ_W_A="${PROJ_W_A:-200.0}"
+PROJ_W_J="${PROJ_W_J:-50.0}"
+PROJ_W_UAV_BACK="${PROJ_W_UAV_BACK:-200.0}"
+PROJ_W_UAV_TURN="${PROJ_W_UAV_TURN:-200.0}"
+PROJ_TURN_THETA_MAX_DEG="${PROJ_TURN_THETA_MAX_DEG:-25.0}"
+PROJ_W_UAV_CURV="${PROJ_W_UAV_CURV:-0.0}"
+PROJ_W_UAV_CURV_HARD="${PROJ_W_UAV_CURV_HARD:-800.0}"
+PROJ_UAV_CURV_D2_MAX="${PROJ_UAV_CURV_D2_MAX:-0.05}"
+PROJ_PROG_EPS="${PROJ_PROG_EPS:-0.002}"
+PROJ_ITERS="${PROJ_ITERS:-400}"
+PROJ_MAX_DELTA="${PROJ_MAX_DELTA:-1.20}"
 
 OUTS=()
 
@@ -92,14 +115,20 @@ for SEED in $SEEDS; do
   echo "[RUN] $OUT"
 
   CMD=(
-    python -u scripts/eval/eval_eagle_grasp.py
+    "$PYTHON" -u scripts/eval/eval_eagle_grasp.py
     --dataset_file_merged "$DATA_ROOT"
     --ckpt "$MASTER_CKPT" --device "$DEVICE"
     --obst_preset "$OBST_PRESET"
     --n_cases "$N_CASES" --n_samples "$N_SAMPLES"
+    --case_start "$CASE_START"
     --save_dir "$OUT"
     --H 144 --mode endpoints_and_mid_hard --ctx_mode orig --t_g 72 --seed "$SEED"
     --obst_enable
+    --obst_mode "$OBST_MODE"
+    --obst_total_n "$OBST_TOTAL_N"
+    --obst_size_scale "$OBST_SIZE_SCALE"
+    --obst_corridor_radius "$OBST_CORRIDOR_RADIUS"
+    --obst_corridor_resample_max "$OBST_CORRIDOR_RESAMPLE_MAX"
     --obst_random_enable
     --obst_random_n_min "$RANDOM_N_MIN"
     --obst_random_n_max "$RANDOM_N_MAX"
@@ -145,16 +174,26 @@ for SEED in $SEEDS; do
     --obst_select_w_turn "$SELECT_W_TURN"
     --obst_select_w_straight "$SELECT_W_STRAIGHT"
     --obst_select_max_len_ratio "$SELECT_MAX_PATH_LEN_RATIO"
-    --obst_project_enable
-    --obst_proj_adaptive_enable
-    --obst_proj_w_len "$PROJ_W_LEN"
-    --obst_proj_w_ref "$PROJ_W_REF"
-    --obst_proj_w_len_ratio "$PROJ_W_LEN_RATIO"
-    --obst_proj_max_len_ratio "$PROJ_MAX_LEN_RATIO"
-    --obst_proj_w_uav_turn "$PROJ_W_UAV_TURN"
-    --obst_proj_turn_theta_max_deg "$PROJ_TURN_THETA_MAX_DEG"
-    --obst_proj_w_uav_curv "$PROJ_W_UAV_CURV"
-  )
+	    --obst_project_enable
+	    --obst_proj_adaptive_enable
+	    --obst_proj_iters "$PROJ_ITERS"
+	    --obst_proj_w_data "$PROJ_W_DATA"
+	    --obst_proj_w_v "$PROJ_W_V"
+	    --obst_proj_w_a "$PROJ_W_A"
+	    --obst_proj_w_j "$PROJ_W_J"
+	    --obst_proj_w_len "$PROJ_W_LEN"
+	    --obst_proj_w_ref "$PROJ_W_REF"
+	    --obst_proj_w_len_ratio "$PROJ_W_LEN_RATIO"
+	    --obst_proj_max_len_ratio "$PROJ_MAX_LEN_RATIO"
+	    --obst_proj_w_uav_back "$PROJ_W_UAV_BACK"
+	    --obst_proj_w_uav_turn "$PROJ_W_UAV_TURN"
+	    --obst_proj_turn_theta_max_deg "$PROJ_TURN_THETA_MAX_DEG"
+	    --obst_proj_w_uav_curv "$PROJ_W_UAV_CURV"
+	    --obst_proj_w_uav_curv_hard "$PROJ_W_UAV_CURV_HARD"
+	    --obst_proj_uav_curv_d2_max "$PROJ_UAV_CURV_D2_MAX"
+	    --obst_proj_prog_eps "$PROJ_PROG_EPS"
+	    --obst_proj_max_delta "$PROJ_MAX_DELTA"
+	  )
 
   if [[ -n "$WORKSPACE_MIN" ]]; then
     CMD+=(--obst_workspace_min="$WORKSPACE_MIN")
@@ -174,11 +213,14 @@ for SEED in $SEEDS; do
       CMD+=(--obst_random_boxes_n "$RANDOM_BOX_N")
     fi
   fi
+  if [[ "$OBST_EFFECT_CHECK" == "1" ]]; then
+    CMD+=(--obst_effect_check)
+  fi
 
   "${CMD[@]}" 2>&1 | tee "$OUT/eval.log"
 done
 
-python - "${OUTS[@]}" "$STRICT" "$STRICT_CLR_MIN" <<'PY'
+"$PYTHON" - "${OUTS[@]}" "$STRICT" "$STRICT_CLR_MIN" <<'PY'
 import re
 import sys
 import numpy as np

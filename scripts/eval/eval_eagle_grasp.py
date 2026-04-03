@@ -5,6 +5,7 @@ import sys
 import numpy as np
 import math
 import random
+import hashlib
 
 import torch
 import pinocchio as pin
@@ -660,6 +661,462 @@ def _compute_turn_xy(traj_xyz):
     return float(np.sum(np.abs(dheading[valid_pair])))
 
 
+def _polyline_curvature_xyz(poly_xyz: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """
+    Discrete polyline curvature magnitude (1/m) at each vertex using the
+    circumcircle formula:
+        kappa = 4*Area / (a*b*c) = 2*||cross|| / (a*b*c)
+    where a,b,c are triangle side lengths for (p[i-1],p[i],p[i+1]).
+    """
+    xyz = np.asarray(poly_xyz, dtype=np.float64).reshape(-1, 3)
+    H = int(xyz.shape[0])
+    if H <= 0:
+        return np.zeros((0,), dtype=np.float64)
+    if H < 3:
+        return np.zeros((H,), dtype=np.float64)
+
+    p0 = xyz[:-2]
+    p1 = xyz[1:-1]
+    p2 = xyz[2:]
+    a = np.linalg.norm(p1 - p0, axis=1)
+    b = np.linalg.norm(p2 - p1, axis=1)
+    c = np.linalg.norm(p2 - p0, axis=1)
+    cross = np.cross((p1 - p0), (p2 - p1))
+    area2 = np.linalg.norm(cross, axis=1)
+    denom = a * b * c
+    k = np.zeros_like(area2, dtype=np.float64)
+    m = denom > float(eps)
+    k[m] = 2.0 * area2[m] / denom[m]
+
+    out = np.zeros((H,), dtype=np.float64)
+    out[1:-1] = k
+    out[0] = out[1]
+    out[-1] = out[-2]
+    out = np.where(np.isfinite(out), out, 0.0)
+    return out
+
+
+def _polyline_d2_norm_max_xyz(poly_xyz: np.ndarray) -> float:
+    xyz = np.asarray(poly_xyz, dtype=np.float64).reshape(-1, 3)
+    H = int(xyz.shape[0])
+    if H < 3:
+        return 0.0
+    d2 = xyz[2:] - 2.0 * xyz[1:-1] + xyz[:-2]
+    d2n = np.linalg.norm(d2, axis=1)
+    if d2n.size == 0:
+        return 0.0
+    m = float(np.max(d2n))
+    return m if np.isfinite(m) else 0.0
+
+
+def _polyline_turn_max_deg_xyz(poly_xyz: np.ndarray, eps: float = 1e-12) -> float:
+    xyz = np.asarray(poly_xyz, dtype=np.float64).reshape(-1, 3)
+    H = int(xyz.shape[0])
+    if H < 3:
+        return 0.0
+    v0 = xyz[1:-1] - xyz[:-2]
+    v1 = xyz[2:] - xyz[1:-1]
+    n0 = np.linalg.norm(v0, axis=1)
+    n1 = np.linalg.norm(v1, axis=1)
+    den = n0 * n1
+    m = den > float(eps)
+    if np.count_nonzero(m) == 0:
+        return 0.0
+    cosang = np.zeros((H - 2,), dtype=np.float64)
+    cosang[m] = np.sum(v0[m] * v1[m], axis=1) / den[m]
+    cosang = np.clip(cosang, -1.0, 1.0)
+    ang = np.degrees(np.arccos(cosang))
+    val = float(np.max(ang)) if ang.size else 0.0
+    return val if np.isfinite(val) else 0.0
+
+
+def _clearance_uav_xyz_to_spheres_batch(xyz_sxhx3: np.ndarray, spheres, uav_radius: float = 0.0) -> np.ndarray:
+    """
+    Compute per-point clearance to a list of spheres for a batch of UAV xyz polylines.
+    clearance = min_k ||p - c_k|| - r_k - uav_radius
+    Returns: (S,H)
+    """
+    xyz = np.asarray(xyz_sxhx3, dtype=np.float64)
+    if xyz.ndim == 2:
+        xyz = xyz[None, :, :]
+    xyz = xyz.reshape(int(xyz.shape[0]), int(xyz.shape[1]), 3)
+    S, H, _ = xyz.shape
+
+    out = np.full((S, H), float("inf"), dtype=np.float64)
+    if spheres is None or len(spheres) == 0:
+        return out
+
+    uav_r = float(max(0.0, uav_radius))
+    for c, r in spheres:
+        cc = np.asarray(c, dtype=np.float64).reshape(1, 1, 3)
+        rr = float(r)
+        d = np.linalg.norm(xyz - cc, axis=2) - rr - uav_r
+        out = np.minimum(out, d)
+    return out
+
+
+def _resample_xyz_uniform_dt(xyz: np.ndarray, t: np.ndarray, dt_ctrl: float, eps: float = 1e-9):
+    """
+    Convert a piecewise-linear polyline xyz(t_i) with monotonically increasing timestamps t_i
+    into uniformly-spaced setpoints at control cycle dt_ctrl.
+
+    NOTE: This is for EXECUTION setpoints (time grid). It must NOT modify geometry of the original
+    polyline; it only adds intermediate points via linear interpolation in time.
+    """
+    xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+    t = np.asarray(t, dtype=np.float64).reshape(-1)
+    H = int(xyz.shape[0])
+    if H <= 0:
+        zt = np.zeros((0,), dtype=np.float64)
+        z3 = np.zeros((0, 3), dtype=np.float64)
+        return zt, z3, z3
+    if t.shape[0] != H:
+        raise ValueError(f"bad time shape: t={t.shape} xyz={xyz.shape}")
+
+    # Shift so t[0]=0 and enforce strict monotonicity.
+    t = t - float(t[0]) if np.isfinite(float(t[0])) else t
+    t = np.maximum.accumulate(t)
+    for i in range(1, H):
+        if not (t[i] > t[i - 1]):
+            t[i] = t[i - 1] + float(max(1e-6, eps))
+
+    t_end = float(t[-1])
+    if (not np.isfinite(t_end)) or t_end < 0.0:
+        t_end = 0.0
+
+    dt = float(max(float(dt_ctrl), 1e-6))
+    t_exec = np.arange(0.0, t_end + 1e-12, dt, dtype=np.float64)
+    if t_exec.size <= 0:
+        t_exec = np.array([0.0], dtype=np.float64)
+    # Ensure the last point matches t_end exactly.
+    if float(t_exec[-1]) < t_end - 1e-9:
+        t_exec = np.concatenate([t_exec, np.array([t_end], dtype=np.float64)], axis=0)
+    else:
+        t_exec[-1] = t_end
+
+    xyz_exec = np.stack([np.interp(t_exec, t, xyz[:, k]) for k in range(3)], axis=1).astype(np.float64)
+    vel_exec = np.zeros_like(xyz_exec, dtype=np.float64)
+    if t_exec.size >= 2:
+        dt_seg = np.diff(t_exec).astype(np.float64)
+        dt_seg = np.maximum(dt_seg, 1e-6)
+        vel_exec[:-1] = np.diff(xyz_exec, axis=0) / dt_seg[:, None]
+        vel_exec[-1] = vel_exec[-2]
+    return t_exec, xyz_exec, vel_exec
+
+
+def _time_parameterize_xyz_by_clearance_and_curvature(
+    xyz: np.ndarray,
+    clr: np.ndarray,
+    safe_margin: float,
+    d_goal: np.ndarray = None,
+    goal_mode: str = "smoothstep",
+    goal_sigma: float = 0.25,
+    goal_d_stop: float = 0.08,
+    goal_d_full: float = 0.35,
+    v_free: float = -1.0,
+    v_max: float = -1.0,
+    v_min_ratio: float = 0.05,
+    v_min_goal: float = 0.10,
+    goal_r_stop: float = 0.20,
+    goal_k: float = 0.05,
+    obs_clr0_factor: float = 2.0,
+    obs_clr_k_factor: float = 0.5,
+    a_max: float = -1.0,
+    a_lat_max: float = -1.0,
+    kappa_ref_p: float = 95.0,
+    dt_min: float = 1e-4,
+    dt_max: float = 10.0,
+    cap_smooth_window: int = 1,
+    j_max: float = 0.0,
+    j_iters: int = 3,
+    return_debug_arrays: bool = False,
+):
+    """
+    Geometry-only time scaling for visualization/control:
+      - cap speed by clearance (slow near obstacles)
+      - cap speed by curvature (slow in sharp turns)
+      - enforce longitudinal accel constraint via forward/backward passes
+
+    Returns:
+      t:   (H,) cumulative time
+      v:   (H,) speed profile along the polyline (at vertices)
+      acc: (H,) approx longitudinal acceleration
+      info: dict with used parameters (debug)
+    """
+    xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+    H = int(xyz.shape[0])
+    if H <= 0:
+        z = np.zeros((0,), dtype=np.float64)
+        return z, z, z, {}
+    if H == 1:
+        z = np.zeros((1,), dtype=np.float64)
+        return z, z, z, {}
+
+    seg = np.diff(xyz, axis=0)
+    ds = np.linalg.norm(seg, axis=1).astype(np.float64)
+    ds_mean = float(np.mean(ds)) if ds.size else 0.0
+    ds_mean = float(ds_mean) if np.isfinite(ds_mean) else 0.0
+
+    if float(v_free) <= 0.0:
+        # Auto: use a reasonable default in metric units (m/s) instead of "per-step".
+        v_free = 1.0
+    if float(v_max) <= 0.0:
+        v_max = float(v_free)
+    v_min = float(max(float(v_free) * float(max(0.0, v_min_ratio)), 1e-6))
+    v_min_goal = float(max(0.0, float(v_min_goal)))
+
+    if float(a_max) <= 0.0:
+        # Auto: conservative default (m/s^2). Users can override for a more aggressive profile.
+        a_max = 1.0
+
+    # Curvature-based speed cap
+    kappa = _polyline_curvature_xyz(xyz)
+    if float(a_lat_max) <= 0.0:
+        kk = np.asarray(kappa, dtype=np.float64).reshape(-1)
+        kk = kk[np.isfinite(kk)]
+        kk = kk[kk > 1e-12]
+        if kk.size > 0:
+            k_ref = float(np.percentile(kk, float(kappa_ref_p)))
+            if np.isfinite(k_ref) and k_ref > 1e-12:
+                a_lat_max = float((float(v_free) ** 2) * k_ref)
+            else:
+                a_lat_max = float("inf")
+        else:
+            a_lat_max = float("inf")
+    k_eps = 1e-9
+    if np.isfinite(float(a_lat_max)):
+        v_cap_curv = np.sqrt(float(a_lat_max) / np.maximum(kappa, k_eps))
+    else:
+        v_cap_curv = np.full((H,), float("inf"), dtype=np.float64)
+
+    def _sigmoid(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        # Avoid overflow in exp for extreme x.
+        x = np.clip(x, -60.0, 60.0)
+        return 1.0 / (1.0 + np.exp(-x))
+
+    # Clearance-based speed cap (sigmoid), slow near obstacles.
+    clr = np.asarray(clr, dtype=np.float64).reshape(-1)
+    if clr.shape[0] != H:
+        clr = np.full((H,), float("inf"), dtype=np.float64)
+    sm = float(max(0.0, safe_margin))
+    sm_base = float(max(sm, 0.05))
+    clr0 = float(max(0.0, sm * float(max(0.0, obs_clr0_factor))))
+    k_obs = float(max(1e-6, sm_base * float(max(1e-6, obs_clr_k_factor))))
+    sig_obs = _sigmoid((clr - clr0) / k_obs)
+    sig_obs[~np.isfinite(sig_obs)] = 1.0
+    v_cap_clr = float(v_min) + (float(v_free) - float(v_min)) * sig_obs
+
+    # Goal/grasp speed cap:
+    # - 'clamp': monotone slow-down as d_goal gets smaller (simple to tune)
+    # - 'sigmoid': monotone slow-down as d_goal gets smaller (smooth)
+    # - 'valley': bell-shaped "speed valley" centered at the closest grasp point, so it slows down
+    #   near grasp and speeds up again after leaving. This matches "approach slow, depart fast".
+    v_cap_goal = np.full((H,), float("inf"), dtype=np.float64)
+    if d_goal is not None:
+        dg = np.asarray(d_goal, dtype=np.float64).reshape(-1)
+        if dg.shape[0] == H:
+            # Cumulative arc length at vertices (based on UAV xyz; stable and cheap).
+            s_v = np.zeros((H,), dtype=np.float64)
+            if ds.size > 0:
+                s_v[1:] = np.cumsum(ds, axis=0)
+
+            mode = str(goal_mode).strip().lower()
+            if mode in ("none", "off", "disable"):
+                v_cap_goal = np.full((H,), float("inf"), dtype=np.float64)
+            elif mode in ("smoothstep", "smooth"):
+                # Smoothstep ramp (C1, zero slope at ends):
+                #   d <= d_stop -> v_min_goal
+                #   d >= d_full -> v_free
+                d_stop = float(max(0.0, float(goal_d_stop)))
+                d_full = float(max(0.0, float(goal_d_full)))
+                if (not np.isfinite(d_full)) or (d_full <= d_stop + 1e-9):
+                    # Fallback to legacy params if misconfigured.
+                    d_full = d_stop + float(max(1e-6, float(goal_k)))
+                u = (dg - d_stop) / float(max(1e-9, (d_full - d_stop)))
+                u = np.clip(u, 0.0, 1.0)
+                u[~np.isfinite(u)] = 1.0
+                u2 = u * u * (3.0 - 2.0 * u)
+                v_cap_goal = float(v_min_goal) + (float(v_free) - float(v_min_goal)) * u2
+            elif mode in ("clamp", "linear"):
+                # Monotone ramp in distance:
+                #   d <= d_stop -> v_min_goal
+                #   d >= d_full -> v_free
+                # with a linear interpolation between.
+                d_stop = float(max(0.0, float(goal_r_stop)))
+                d_full = d_stop + float(max(1e-6, float(goal_k)))
+                w = (dg - d_stop) / float(max(1e-6, d_full - d_stop))
+                w = np.clip(w, 0.0, 1.0)
+                w[~np.isfinite(w)] = 1.0
+                v_cap_goal = float(v_min_goal) + (float(v_free) - float(v_min_goal)) * w
+            elif mode == "sigmoid":
+                k_goal = float(max(1e-6, float(goal_k)))
+                r_stop = float(max(0.0, float(goal_r_stop)))
+                sig_goal = _sigmoid((dg - r_stop) / k_goal)
+                sig_goal[~np.isfinite(sig_goal)] = 1.0
+                v_cap_goal = float(v_min_goal) + (float(v_free) - float(v_min_goal)) * sig_goal
+            else:
+                # Default: gaussian valley around the closest approach to grasp target.
+                # Use dg to locate the "grasp event" index i*, but cap speed based on arc-length proximity.
+                i_star = int(np.nanargmin(dg)) if np.any(np.isfinite(dg)) else int(H // 2)
+                i_star = int(max(0, min(H - 1, i_star)))
+                sig_m = float(max(1e-6, float(goal_sigma)))
+                s0 = float(s_v[i_star])
+                w = np.exp(-0.5 * ((s_v - s0) / sig_m) ** 2)
+                w = np.clip(w, 0.0, 1.0)
+                # Speed valley: far away ~ v_free, near grasp ~ v_min_goal.
+                v_cap_goal = float(v_free) * (1.0 - w) + float(v_min_goal) * w
+
+    def _moving_average(x: np.ndarray, window: int) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        w = int(max(1, int(window)))
+        if w <= 1:
+            return x.copy()
+        if w % 2 == 0:
+            w += 1
+        pad = w // 2
+        x_pad = np.pad(x, (pad, pad), mode="edge")
+        ker = np.ones((w,), dtype=np.float64) / float(w)
+        y = np.convolve(x_pad, ker, mode="valid")
+        if y.shape[0] != x.shape[0]:
+            y = y[: x.shape[0]]
+        return y
+
+    v_cap_raw = np.minimum(float(v_max), np.minimum(np.minimum(v_cap_clr, v_cap_goal), v_cap_curv))
+    v_cap_raw = np.clip(v_cap_raw, 0.0, float(v_max))
+
+    # Optional: smooth the final cap to avoid hard corners, but NEVER allow it to exceed the original cap.
+    v_cap = np.asarray(v_cap_raw, dtype=np.float64).copy()
+    w_cap = int(max(1, int(cap_smooth_window)))
+    if w_cap > 1:
+        v_cap_sm = _moving_average(v_cap_raw, window=w_cap)
+        v_cap = np.minimum(v_cap_sm, v_cap_raw)
+        v_cap = np.clip(v_cap, 0.0, float(v_max))
+
+    v = np.asarray(v_cap, dtype=np.float64).copy()
+
+    # Enforce accel via forward/backward passes in arc-length domain.
+    if ds.size > 0:
+        for i in range(H - 1):
+            vlim = math.sqrt(max(0.0, float(v[i]) * float(v[i]) + 2.0 * float(a_max) * float(ds[i])))
+            if float(v[i + 1]) > vlim:
+                v[i + 1] = vlim
+        for i in range(H - 2, -1, -1):
+            vlim = math.sqrt(max(0.0, float(v[i + 1]) * float(v[i + 1]) + 2.0 * float(a_max) * float(ds[i])))
+            if float(v[i]) > vlim:
+                v[i] = vlim
+
+    # Optional: jerk limiting in time domain (heuristic projection).
+    # We iterate a few times:
+    #   compute dt from current v -> compute segment accel -> jerk-clip accel -> integrate v -> enforce cap -> accel pass.
+    j_max_f = float(j_max)
+    j_iters_i = int(max(0, int(j_iters)))
+    dt_min_f = float(max(1e-6, dt_min))
+    dt_max_f = float(max(dt_min_f, dt_max))
+    if (ds.size > 0) and (j_max_f > 0.0) and (j_iters_i > 0):
+        for _it in range(j_iters_i):
+            v_seg = 0.5 * (v[:-1] + v[1:])
+            v_seg = np.maximum(v_seg, 1e-6)
+            dt_seg = ds / v_seg
+            dt_seg = np.where(np.isfinite(dt_seg), dt_seg, dt_max_f)
+            dt_seg = np.clip(dt_seg, dt_min_f, dt_max_f)
+
+            a_seg = np.diff(v) / np.maximum(dt_seg, 1e-6)  # (H-1,)
+            a_seg = np.clip(a_seg, -float(a_max), float(a_max))
+
+            # forward jerk clip
+            for i in range(int(a_seg.shape[0]) - 1):
+                dtm = 0.5 * (float(dt_seg[i]) + float(dt_seg[i + 1]))
+                bound = float(j_max_f) * float(dtm)
+                a_seg[i + 1] = float(np.clip(a_seg[i + 1], a_seg[i] - bound, a_seg[i] + bound))
+            # backward jerk clip
+            for i in range(int(a_seg.shape[0]) - 2, -1, -1):
+                dtm = 0.5 * (float(dt_seg[i]) + float(dt_seg[i + 1]))
+                bound = float(j_max_f) * float(dtm)
+                a_seg[i] = float(np.clip(a_seg[i], a_seg[i + 1] - bound, a_seg[i + 1] + bound))
+
+            v_new = np.zeros_like(v, dtype=np.float64)
+            v_new[0] = float(v[0])
+            for i in range(int(a_seg.shape[0])):
+                v_new[i + 1] = v_new[i] + float(a_seg[i]) * float(dt_seg[i])
+
+            v_new = np.where(np.isfinite(v_new), v_new, 1e-6)
+            v_new = np.clip(v_new, 1e-6, float(v_max))
+            # Conservative projection: never allow jerk-projection to SPEED UP the profile.
+            # This keeps the operation "only slower, never faster" and avoids unexpected sharp changes.
+            v_candidate = np.minimum(v_new, v_cap)
+            v = np.minimum(v, v_candidate)
+
+            # Re-enforce accel constraints after jerk projection.
+            for i in range(H - 1):
+                vlim = math.sqrt(max(0.0, float(v[i]) * float(v[i]) + 2.0 * float(a_max) * float(ds[i])))
+                if float(v[i + 1]) > vlim:
+                    v[i + 1] = vlim
+            for i in range(H - 2, -1, -1):
+                vlim = math.sqrt(max(0.0, float(v[i + 1]) * float(v[i + 1]) + 2.0 * float(a_max) * float(ds[i])))
+                if float(v[i]) > vlim:
+                    v[i] = vlim
+
+    # Time integration (trapezoidal in speed): dt = ds / v_seg, v_seg = 0.5*(v_i+v_{i+1}).
+    v_seg = 0.5 * (v[:-1] + v[1:])
+    # NOTE: do not clamp by v_min here; it would artificially speed-up segments and defeat "slow near obstacles/goal".
+    v_seg = np.maximum(v_seg, 1e-6)
+    dt = ds / v_seg
+    dt = np.where(np.isfinite(dt), dt, dt_max_f)
+    dt = np.clip(dt, dt_min_f, dt_max_f)
+    t = np.concatenate([[0.0], np.cumsum(dt)], axis=0).astype(np.float64)
+    # Strictly increasing time.
+    for i in range(1, H):
+        if not (t[i] > t[i - 1]):
+            t[i] = t[i - 1] + 1e-6
+
+    acc = np.zeros((H,), dtype=np.float64)
+    if dt.size > 0:
+        dd = np.maximum(dt, 1e-6)
+        acc[:-1] = np.diff(v) / dd
+        if H >= 2:
+            acc[-1] = acc[-2]
+
+    info = dict(
+        v_free=float(v_free),
+        v_max=float(v_max),
+        v_min=float(v_min),
+        v_min_goal=float(v_min_goal),
+        goal_mode=str(goal_mode),
+        goal_sigma=float(goal_sigma),
+        goal_d_stop=float(goal_d_stop),
+        goal_d_full=float(goal_d_full),
+        goal_r_stop=float(goal_r_stop),
+        goal_k=float(goal_k),
+        obs_clr0=float(clr0),
+        obs_k=float(k_obs),
+        a_max=float(a_max),
+        a_lat_max=float(a_lat_max),
+        kappa_ref_p=float(kappa_ref_p),
+        dt_min=float(dt_min),
+        dt_max=float(dt_max),
+        cap_smooth_window=int(w_cap),
+        j_max=float(j_max_f),
+        j_iters=int(j_iters_i),
+    )
+    if bool(return_debug_arrays):
+        info["dbg_kappa"] = np.asarray(kappa, dtype=np.float32)
+        info["dbg_clr"] = np.asarray(clr, dtype=np.float32)
+        if d_goal is not None:
+            try:
+                info["dbg_d_goal"] = np.asarray(d_goal, dtype=np.float32).reshape(-1)
+            except Exception:
+                pass
+        info["dbg_v_cap_raw"] = np.asarray(v_cap_raw, dtype=np.float32)
+        info["dbg_v_cap"] = np.asarray(v_cap, dtype=np.float32)
+        info["dbg_v_cap_clr"] = np.asarray(v_cap_clr, dtype=np.float32)
+        info["dbg_v_cap_goal"] = np.asarray(v_cap_goal, dtype=np.float32)
+        info["dbg_v_cap_curv"] = np.asarray(v_cap_curv, dtype=np.float32)
+        info["dbg_v"] = np.asarray(v, dtype=np.float32)
+        info["dbg_dt_seg"] = np.asarray(dt, dtype=np.float32)
+    return t, v, acc, info
+
+
 def _parse_obst_spheres(spec_list):
     return _parse_obstacle_spheres_impl(spec_list)
 
@@ -714,6 +1171,282 @@ def _anchor_min_clearance(anchor_points, spheres):
             if d < best:
                 best = d
     return best
+
+
+def _sample_in_size_bin(rng, lo: float, hi: float, bin_id: int) -> float:
+    """
+    Sample uniformly from one of 3 size bins in [lo,hi] (bin_id in {0,1,2}).
+    This mirrors mpd/planning/obstacle_guidance.py so "mixed" size mode is stable.
+    """
+    l = float(lo)
+    h = float(hi)
+    if h <= l:
+        return l
+    bins = {
+        0: (0.0, 1.0 / 3.0),
+        1: (1.0 / 3.0, 2.0 / 3.0),
+        2: (2.0 / 3.0, 1.0),
+    }
+    b_lo, b_hi = bins.get(int(bin_id), (0.0, 1.0))
+    seg_lo = l + (h - l) * float(b_lo)
+    seg_hi = l + (h - l) * float(b_hi)
+    if seg_hi <= seg_lo:
+        seg_lo, seg_hi = l, h
+    return float(rng.uniform(seg_lo, seg_hi))
+
+
+def _obst_hash_sha1(spheres_np: np.ndarray, boxes_np: np.ndarray) -> str:
+    """
+    Stable obstacle hash used to verify "planner uses same obstacles as visualization".
+    """
+    h = hashlib.sha1()
+    sph = np.asarray(spheres_np, dtype=np.float32).reshape(-1, 4)
+    box = np.asarray(boxes_np, dtype=np.float32).reshape(-1, 6)
+    h.update(sph.tobytes(order="C"))
+    h.update(box.tobytes(order="C"))
+    return h.hexdigest()
+
+
+def _min_clearance_segment_to_spheres(start_xyz, goal_xyz, spheres, uav_radius=0.0) -> float:
+    """
+    Exact min clearance (to sphere surfaces) along the straight segment start->goal, minus uav_radius.
+    """
+    if spheres is None or len(spheres) == 0:
+        return float("inf")
+    a = np.asarray(start_xyz, dtype=np.float64).reshape(3)
+    b = np.asarray(goal_xyz, dtype=np.float64).reshape(3)
+    v = b - a
+    vv = float(np.dot(v, v))
+    uav_r = float(max(0.0, uav_radius))
+    best = float("inf")
+    for c, r in spheres:
+        cc = np.asarray(c, dtype=np.float64).reshape(3)
+        rr = float(r)
+        if vv <= 1e-12:
+            d = float(np.linalg.norm(a - cc) - rr - uav_r)
+        else:
+            t = float(np.dot(cc - a, v) / vv)
+            t = float(np.clip(t, 0.0, 1.0))
+            p = a + t * v
+            d = float(np.linalg.norm(p - cc) - rr - uav_r)
+        if d < best:
+            best = d
+    return best
+
+
+def _perp_basis_from_dir(v: np.ndarray):
+    """
+    Build an orthonormal basis (n1,n2) perpendicular to direction v.
+    """
+    v = np.asarray(v, dtype=np.float64).reshape(3)
+    n = float(np.linalg.norm(v))
+    if (not np.isfinite(n)) or n <= 1e-12:
+        return None, None
+    v = v / n
+    a = np.array([1.0, 0.0, 0.0], dtype=np.float64) if abs(float(v[0])) < 0.9 else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    n1 = np.cross(v, a)
+    n1n = float(np.linalg.norm(n1))
+    if n1n <= 1e-12:
+        a = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        n1 = np.cross(v, a)
+        n1n = float(np.linalg.norm(n1))
+        if n1n <= 1e-12:
+            return None, None
+    n1 = n1 / n1n
+    n2 = np.cross(v, n1)
+    n2n = float(np.linalg.norm(n2))
+    if n2n <= 1e-12:
+        return None, None
+    n2 = n2 / n2n
+    return n1, n2
+
+
+def _point_segment_distance(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    """
+    Euclidean distance from point p to segment [a,b].
+    """
+    p = np.asarray(p, dtype=np.float64).reshape(3)
+    a = np.asarray(a, dtype=np.float64).reshape(3)
+    b = np.asarray(b, dtype=np.float64).reshape(3)
+    v = b - a
+    vv = float(np.dot(v, v))
+    if vv <= 1e-12:
+        return float(np.linalg.norm(p - a))
+    t = float(np.dot(p - a, v) / vv)
+    t = float(np.clip(t, 0.0, 1.0))
+    proj = a + t * v
+    return float(np.linalg.norm(p - proj))
+
+
+def _point_polyline_distance(p: np.ndarray, poly_xyz: np.ndarray) -> float:
+    """
+    Euclidean distance from point p to a polyline defined by vertices poly_xyz (N,3).
+    """
+    pts = np.asarray(poly_xyz, dtype=np.float64).reshape(-1, 3)
+    if pts.shape[0] <= 0:
+        return float("inf")
+    if pts.shape[0] == 1:
+        return float(np.linalg.norm(np.asarray(p, dtype=np.float64).reshape(3) - pts[0]))
+    best = float("inf")
+    for i in range(pts.shape[0] - 1):
+        d = _point_segment_distance(p, pts[i], pts[i + 1])
+        if d < best:
+            best = float(d)
+    return best
+
+
+def _polyline_min_clearance_to_spheres(poly_xyz: np.ndarray, spheres, uav_radius: float = 0.0) -> float:
+    """
+    Clearance of a polyline (sequence of vertices) to spheres, using segment-wise analytic distance.
+    """
+    pts = np.asarray(poly_xyz, dtype=np.float64).reshape(-1, 3)
+    if pts.shape[0] < 2:
+        return float("inf")
+    best = float("inf")
+    for i in range(pts.shape[0] - 1):
+        d = _min_clearance_segment_to_spheres(
+            start_xyz=pts[i],
+            goal_xyz=pts[i + 1],
+            spheres=spheres,
+            uav_radius=uav_radius,
+        )
+        if d < best:
+            best = float(d)
+    return best
+
+
+def _sample_global_candidates(
+    rng: np.random.Generator,
+    n_candidates: int,
+    xyz_min: np.ndarray,
+    xyz_max: np.ndarray,
+    r_min: float,
+    r_max: float,
+    anchor_points: np.ndarray,
+    anchor_clearance: float,
+    existing_spheres,
+    avoid_overlap: bool,
+    overlap_margin: float,
+    center_min_dist: float,
+    start_xyz: np.ndarray,
+    goal_xyz: np.ndarray,
+    start_goal_buffer: float,
+    safe_margin: float,
+    uav_radius: float,
+    radius_mode: str = "mixed",
+):
+    xyz_min = np.asarray(xyz_min, dtype=np.float64).reshape(3)
+    xyz_max = np.asarray(xyz_max, dtype=np.float64).reshape(3)
+    r_lo = float(min(r_min, r_max))
+    r_hi = float(max(r_min, r_max))
+    anchors = None
+    if anchor_points is not None:
+        ap = np.asarray(anchor_points, dtype=np.float64).reshape(-1, 3)
+        if ap.shape[0] > 0:
+            anchors = ap
+    anc_margin = float(max(0.0, anchor_clearance))
+    ov_margin = float(max(0.0, overlap_margin))
+    c_min_dist = float(max(0.0, center_min_dist))
+    start_xyz = np.asarray(start_xyz, dtype=np.float64).reshape(3)
+    goal_xyz = np.asarray(goal_xyz, dtype=np.float64).reshape(3)
+    uav_r = float(max(0.0, uav_radius))
+    safe_margin = float(max(0.0, safe_margin))
+    buffer = float(max(0.0, start_goal_buffer))
+
+    existing = []
+    if existing_spheres is not None:
+        for c, r in existing_spheres:
+            existing.append((np.asarray(c, dtype=np.float64).reshape(3), float(r)))
+
+    r_mode = str(radius_mode).strip().lower()
+    if r_mode not in ("uniform", "mixed"):
+        r_mode = "mixed"
+
+    # 3 bins to spread sizes when m is small.
+    bin_ids = [0, 1, 2] if int(n_candidates) >= 3 else [0]
+    out = []
+    tries = 0
+    max_tries = int(max(1000, int(n_candidates) * 300))
+    while len(out) < int(max(1, n_candidates)) and tries < max_tries:
+        tries += 1
+        if r_mode == "uniform":
+            r = float(rng.uniform(r_lo, r_hi))
+        else:
+            bid = int(bin_ids[len(out) % len(bin_ids)])
+            r = _sample_in_size_bin(rng, r_lo, r_hi, bid)
+
+        lo = xyz_min + r
+        hi = xyz_max - r
+        if np.any(hi <= lo):
+            continue
+        c = rng.uniform(lo, hi).astype(np.float64)
+
+        ok = True
+        if anchors is not None:
+            d = np.linalg.norm(anchors - c[None, :], axis=1) - r
+            if float(np.min(d)) < anc_margin:
+                ok = False
+        if ok:
+            # Avoid start/goal over-squeeze (impossible).
+            min_d = float(r + uav_r + safe_margin + buffer)
+            if float(np.linalg.norm(c - start_xyz)) < min_d:
+                ok = False
+            if ok and float(np.linalg.norm(c - goal_xyz)) < min_d:
+                ok = False
+        if ok and avoid_overlap:
+            for c2, r2 in existing:
+                if float(np.linalg.norm(c - c2)) < (r + float(r2) + ov_margin):
+                    ok = False
+                    break
+            if ok:
+                for c2, r2 in out:
+                    if float(np.linalg.norm(c - c2)) < (r + float(r2) + ov_margin):
+                        ok = False
+                        break
+        if ok and c_min_dist > 0.0:
+            for c2, _ in existing:
+                if float(np.linalg.norm(c - c2)) < c_min_dist:
+                    ok = False
+                    break
+            if ok:
+                for c2, _ in out:
+                    if float(np.linalg.norm(c - c2)) < c_min_dist:
+                        ok = False
+                        break
+        if ok:
+            out.append((c.astype(np.float32), float(r)))
+    return out
+
+
+def _farthest_select_spheres(candidates, existing_spheres, n_select: int):
+    cand = list(candidates or [])
+    if int(n_select) <= 0:
+        return []
+    if len(cand) <= int(n_select):
+        return cand[: int(n_select)]
+    existing = []
+    if existing_spheres is not None:
+        for c, _ in existing_spheres:
+            existing.append(np.asarray(c, dtype=np.float64).reshape(3))
+    picked = []
+    for _ in range(int(n_select)):
+        best_i = None
+        best_score = -float("inf")
+        for i, (c, r) in enumerate(cand):
+            cc = np.asarray(c, dtype=np.float64).reshape(3)
+            pts = existing + [np.asarray(c2, dtype=np.float64).reshape(3) for c2, _ in picked]
+            if len(pts) == 0:
+                score = float("inf")
+            else:
+                d = [float(np.linalg.norm(cc - p)) for p in pts]
+                score = float(min(d)) if len(d) > 0 else float("inf")
+            if score > best_score:
+                best_score = score
+                best_i = i
+        if best_i is None:
+            break
+        picked.append(cand.pop(int(best_i)))
+    return picked
 
 
 def shortcut_xyz_inplace(traj9, spheres, margin, safe_thr=0.10, n_iter=200, keep_idx=None, seed=0):
@@ -837,6 +1570,8 @@ def _flatten_obstacle_preset_to_args(preset: dict):
         "w_uav_turn": "obst_proj_w_uav_turn",
         "turn_theta_max_deg": "obst_proj_turn_theta_max_deg",
         "w_uav_curv": "obst_proj_w_uav_curv",
+        "w_uav_curv_hard": "obst_proj_w_uav_curv_hard",
+        "uav_curv_d2_max": "obst_proj_uav_curv_d2_max",
         "prog_eps": "obst_proj_prog_eps",
         "cgd_shift_step": "obst_proj_cgd_shift_step",
         "margin": "obst_proj_margin",
@@ -938,6 +1673,8 @@ def build_obstacle_cfg_from_args(args, case_spheres):
             w_uav_turn=float(args.obst_proj_w_uav_turn),
             turn_theta_max_deg=float(args.obst_proj_turn_theta_max_deg),
             w_uav_curv=float(args.obst_proj_w_uav_curv),
+            w_uav_curv_hard=float(getattr(args, "obst_proj_w_uav_curv_hard", 0.0)),
+            uav_curv_d2_max=float(getattr(args, "obst_proj_uav_curv_d2_max", 0.0)),
             prog_eps=float(args.obst_proj_prog_eps),
             cgd_shift_step=float(args.obst_proj_cgd_shift_step),
             margin=proj_margin,
@@ -975,7 +1712,7 @@ def sample_obstacles_with_anchor_clearance(
     """
     Feasibility-first random obstacle sampling with anchor-clearance resampling.
     Returns:
-      case_spheres, case_sphere_from_box, case_boxes, scene_min, scene_max
+      case_spheres, case_sphere_from_box, case_boxes, scene_min, scene_max, case_meta
     """
     # For anchor-clearance constraints, only use start/goal.
     # Mid/grasp is intentionally excluded to avoid over-squeezing feasible space.
@@ -1092,6 +1829,390 @@ def sample_obstacles_with_anchor_clearance(
 
     base_spheres = list(fixed_spheres) + list(pc_spheres)
     base_box_flags = [0] * len(base_spheres)
+
+    obst_mode = str(getattr(args, "obst_mode", "random")).strip().lower()
+    if obst_mode in ("corridor_blocking_4", "corridor_block"):
+        obst_mode = "corridor_block4"
+    size_scale = float(getattr(args, "obst_size_scale", 1.0))
+    size_scale = float(max(0.0, size_scale))
+    case_meta = dict(
+        obst_mode=str(obst_mode),
+        obst_total_n=int(getattr(args, "obst_total_n", 4)),
+        obst_size_scale=float(size_scale),
+    )
+
+    # Apply REAL obstacle size scaling at sampling time (not visualization scale).
+    # This keeps overlap/bounds checks consistent under scaling.
+    r_min_eff = float(args.obst_random_r_min) * float(size_scale)
+    r_max_eff = float(args.obst_random_r_max) * float(size_scale)
+    half_min_eff = (np.asarray(rand_box_half_min, dtype=np.float32).reshape(3) * float(size_scale)).astype(np.float32)
+    half_max_eff = (np.asarray(rand_box_half_max, dtype=np.float32).reshape(3) * float(size_scale)).astype(np.float32)
+
+    # =================== special mode: corridor_block4 ===================
+    if obst_mode == "corridor_block4":
+        total_n = int(max(0, int(getattr(args, "obst_total_n", 4))))
+        if total_n <= 0:
+            raise ValueError("[ERR] obst_total_n must be > 0 for corridor_block4")
+        if len(base_spheres) > total_n:
+            raise ValueError(
+                f"[ERR] corridor_block4 requires base_spheres <= total_n, got base_spheres={len(base_spheres)} total_n={total_n}"
+            )
+
+        n_rem = int(total_n - len(base_spheres))
+        n_corr = int(max(0, int(getattr(args, "obst_corridor_n", 2))))
+        n_corr = int(max(0, min(n_rem, n_corr)))
+        n_global = int(max(0, n_rem - n_corr))
+
+        start_xyz = np.asarray(q_start_np[:3], dtype=np.float32).reshape(3)
+        goal_xyz = np.asarray(q_goal_np[:3], dtype=np.float32).reshape(3)
+        mid_xyz = None
+        if (q_mid_np is not None) and (str(mode).strip().lower() == "endpoints_and_mid_hard"):
+            try:
+                mid_xyz = np.asarray(q_mid_np[:3], dtype=np.float32).reshape(3)
+            except Exception:
+                mid_xyz = None
+
+        # Baseline polyline that the task naturally wants (helps make avoidance visible).
+        if mid_xyz is not None:
+            baseline_poly = np.stack([start_xyz, mid_xyz, goal_xyz], axis=0).astype(np.float64)
+        else:
+            baseline_poly = np.stack([start_xyz, goal_xyz], axis=0).astype(np.float64)
+
+        corr_r = float(max(0.0, float(getattr(args, "obst_corridor_radius", 0.4))))
+        s_min = float(getattr(args, "obst_corridor_s_min", 0.25))
+        s_max = float(getattr(args, "obst_corridor_s_max", 0.75))
+        s_min, s_max = float(min(s_min, s_max)), float(max(s_min, s_max))
+        s_min = float(np.clip(s_min, 0.0, 1.0))
+        s_max = float(np.clip(s_max, 0.0, 1.0))
+        if s_max <= s_min:
+            s_min, s_max = 0.25, 0.75
+
+        safe_margin = float(max(0.0, float(args.obst_safe_margin)))
+        block_thr = float(getattr(args, "obst_force_block_thr", -1.0))
+        if block_thr < 0.0:
+            block_thr = float(safe_margin)
+        block_thr = float(max(0.0, block_thr))
+        block_alpha = float(getattr(args, "obst_force_block_alpha", 0.6))
+        block_alpha = float(np.clip(block_alpha, 0.0, 1.0))
+        block_min_clr = float(max(0.0, float(getattr(args, "obst_force_block_min_clr", 0.02))))
+        # Aim for baseline to be unsafe-but-not-colliding:
+        #   block_min_clr <= clr_min_baseline < block_alpha * block_thr
+        block_upper = float(block_alpha * block_thr)
+        if block_upper <= block_min_clr + 1e-6:
+            # Widen minimally to avoid an empty band.
+            block_upper = float(block_min_clr + 1e-3)
+        uav_r = float(max(0.0, float(getattr(args, "obst_uav_radius", 0.0))))
+        start_goal_buffer = float(max(0.0, float(getattr(args, "obst_corridor_start_goal_buffer", 0.08))))
+
+        avoid_overlap = bool(int(getattr(args, "obst_random_avoid_overlap", 1)))
+        overlap_margin = float(max(0.0, float(getattr(args, "obst_random_overlap_margin", 0.01))))
+        center_min_dist = float(max(0.0, float(getattr(args, "obst_random_center_min_dist", 0.0))))
+        # Ensure global spread: enforce a stronger separation that roughly corresponds to 2*safe_margin.
+        if safe_margin > 0.0:
+            overlap_margin = float(max(overlap_margin, 2.0 * safe_margin))
+
+        rng = np.random.default_rng(int(args.seed + int(getattr(args, "obst_random_seed_offset", 0)) + 77777 + idx))
+
+        r_lo = float(min(r_min_eff, r_max_eff))
+        r_hi = float(max(r_min_eff, r_max_eff))
+        if r_hi <= 0.0:
+            raise ValueError(f"[ERR] corridor_block4 got non-positive radius range after scaling: [{r_lo},{r_hi}]")
+        r_lo = float(max(1e-6, r_lo))
+        r_hi = float(max(r_lo, r_hi))
+
+        def _sample_radius_mixed(i: int) -> float:
+            r_mode = str(getattr(args, "obst_random_radius_mode", "mixed")).strip().lower()
+            if r_mode == "uniform":
+                return float(rng.uniform(r_lo, r_hi))
+            bid = int(i % 3)
+            return _sample_in_size_bin(rng, r_lo, r_hi, bid)
+
+        def _valid_center(c: np.ndarray, r: float, existing_spheres_local) -> bool:
+            c = np.asarray(c, dtype=np.float64).reshape(3)
+            r = float(r)
+            # Inside global bounds with margin r
+            lo = np.asarray(global_min, dtype=np.float64).reshape(3) + r
+            hi = np.asarray(global_max, dtype=np.float64).reshape(3) - r
+            if np.any(hi <= lo):
+                return False
+            if np.any(c < lo) or np.any(c > hi):
+                return False
+            # Keep away from start/goal to avoid impossible starts.
+            min_d = float(r + uav_r + safe_margin + start_goal_buffer)
+            if float(np.linalg.norm(c - start_xyz.astype(np.float64))) < min_d:
+                return False
+            if float(np.linalg.norm(c - goal_xyz.astype(np.float64))) < min_d:
+                return False
+            # Anchor clearance (surface distance)
+            if float(_anchor_min_clearance(anchor_points_clr_np, [(c.astype(np.float32), r)])) < float(anchor_clearance_eff):
+                return False
+            # Optional overlap checks
+            if avoid_overlap:
+                for c2, r2 in (existing_spheres_local or []):
+                    c2 = np.asarray(c2, dtype=np.float64).reshape(3)
+                    if float(np.linalg.norm(c - c2)) < (r + float(r2) + overlap_margin):
+                        return False
+            if center_min_dist > 0.0:
+                for c2, _ in (existing_spheres_local or []):
+                    c2 = np.asarray(c2, dtype=np.float64).reshape(3)
+                    if float(np.linalg.norm(c - c2)) < center_min_dist:
+                        return False
+            return True
+
+        def _sample_corridor_spheres(n_need: int, existing_spheres_local):
+            out = []
+            max_tries = int(max(5000, 800 * int(max(1, n_need))))
+            pts = baseline_poly
+            segs = [(pts[i], pts[i + 1]) for i in range(pts.shape[0] - 1)]
+            seg_order = list(range(len(segs)))
+            rng.shuffle(seg_order)
+            for i in range(int(n_need)):
+                ok_i = False
+                for _ in range(max_tries):
+                    # Sample a radius that can fit in the corridor while keeping baseline collision-free.
+                    r_corr_hi = float(min(r_hi, max(r_lo, corr_r - uav_r - block_upper)))
+                    if r_corr_hi < r_lo - 1e-9:
+                        # Corridor too tight for requested radii; fallback to the smallest possible.
+                        r_corr_hi = float(min(r_hi, r_lo))
+                    r = float(rng.uniform(r_lo, r_corr_hi)) if r_corr_hi > r_lo else float(r_lo)
+                    seg_id = 0 if len(segs) <= 1 else int(seg_order[i % len(segs)])
+                    a_seg, b_seg = segs[seg_id]
+                    vdir = (b_seg - a_seg).astype(np.float64)
+                    n1_seg, n2_seg = _perp_basis_from_dir(vdir)
+
+                    s = float(rng.uniform(s_min, s_max))
+                    p = a_seg + s * vdir
+                    # Choose a perpendicular direction and an offset magnitude that yields
+                    # baseline clearance in the desired unsafe band.
+                    if (n1_seg is not None) and (n2_seg is not None):
+                        theta = float(rng.uniform(0.0, 2.0 * math.pi))
+                        dirn = (math.cos(theta) * np.asarray(n1_seg) + math.sin(theta) * np.asarray(n2_seg)).astype(np.float64)
+                    else:
+                        # Degenerate case: fall back to a random direction.
+                        dirn = rng.normal(size=(3,)).astype(np.float64)
+                        dn = float(np.linalg.norm(dirn))
+                        if dn <= 1e-9:
+                            continue
+                        dirn = dirn / dn
+
+                    tclr = float(rng.uniform(block_min_clr, block_upper))
+                    off_mag = float(r + uav_r + tclr)
+                    if corr_r > 0.0 and off_mag > corr_r + 1e-6:
+                        # If corridor is too tight, shrink clearance target (still keep collision-free).
+                        off_mag = float(min(off_mag, corr_r))
+                        tclr = float(max(block_min_clr, off_mag - r - uav_r))
+                    c = p + off_mag * dirn
+                    if not _valid_center(c, r, list(existing_spheres_local) + out):
+                        continue
+                    out.append((np.asarray(c, dtype=np.float32).reshape(3), float(r)))
+                    ok_i = True
+                    break
+                if not ok_i:
+                    break
+            return out
+
+        # Resample corridor obstacles until:
+        # 1) baseline becomes unsafe-but-not-colliding: block_min_clr <= clr < block_upper
+        # 2) there exists a simple 2-segment detour with clr >= safe_margin + detour_buffer
+        corr_resample_max = int(max(1, int(getattr(args, "obst_corridor_resample_max", 50))))
+        best_corr = None
+        best_baseline = float("inf")
+        corridor_spheres = []
+        baseline_clr = float("inf")
+        best_global = None
+        best_detour = -float("inf")
+        detour_buffer = float(max(0.0, float(getattr(args, "obst_detour_buffer", 0.02))))
+        detour_offset_user = float(getattr(args, "obst_detour_offset", -1.0))
+        # Global obstacles should not be close to the corridor (avoid "4 in one clump").
+        global_corridor_margin = float(corr_r + safe_margin)
+
+        for it in range(corr_resample_max):
+            corridor_spheres = _sample_corridor_spheres(n_corr, base_spheres)
+            if len(corridor_spheres) < int(n_corr):
+                continue
+
+            baseline_clr = _polyline_min_clearance_to_spheres(
+                poly_xyz=baseline_poly,
+                spheres=list(base_spheres) + list(corridor_spheres),
+                uav_radius=uav_r,
+            )
+            # Baseline blocking band: unsafe but not collision.
+            baseline_ok = (baseline_clr >= block_min_clr) and (baseline_clr < block_upper)
+            if not baseline_ok:
+                # Keep best attempt as fallback.
+                if baseline_clr < best_baseline:
+                    best_baseline = float(baseline_clr)
+                    best_corr = list(corridor_spheres)
+                continue
+
+            # Sample globally spread spheres via farthest-point selection from random candidates,
+            # with explicit repulsion from the corridor.
+            global_spheres = []
+            if n_global > 0:
+                candidates = _sample_global_candidates(
+                    rng=rng,
+                    n_candidates=1024,
+                    xyz_min=np.asarray(global_min, dtype=np.float32),
+                    xyz_max=np.asarray(global_max, dtype=np.float32),
+                    r_min=r_lo,
+                    r_max=r_hi,
+                    anchor_points=anchor_points_clr_np,
+                    anchor_clearance=anchor_clearance_eff,
+                    existing_spheres=list(base_spheres) + list(corridor_spheres),
+                    avoid_overlap=avoid_overlap,
+                    overlap_margin=overlap_margin,
+                    center_min_dist=center_min_dist,
+                    start_xyz=start_xyz,
+                    goal_xyz=goal_xyz,
+                    start_goal_buffer=start_goal_buffer,
+                    safe_margin=safe_margin,
+                    uav_radius=uav_r,
+                    radius_mode=str(getattr(args, "obst_random_radius_mode", "mixed")),
+                )
+                # Filter candidates far from the corridor segment so global obstacles don't "pile up" near it.
+                cand_far = []
+                for c, r in candidates:
+                    dseg = _point_polyline_distance(np.asarray(c, dtype=np.float64), baseline_poly)
+                    if dseg > float(global_corridor_margin + float(r)):
+                        cand_far.append((c, r))
+                # If too strict (rare), fall back to unfiltered candidates to keep count.
+                cand_use = cand_far if len(cand_far) >= int(n_global) else candidates
+
+                # Greedy farthest selection with a stronger radius-aware separation.
+                picked = []
+                pool = list(cand_use)
+                existing_for_sel = list(base_spheres) + list(corridor_spheres)
+                for _sel in range(int(n_global)):
+                    best_i = None
+                    best_score = -float("inf")
+                    for ci, (c, r) in enumerate(pool):
+                        cc = np.asarray(c, dtype=np.float64).reshape(3)
+                        rr = float(r)
+                        ok_sep = True
+                        for c2, r2 in (existing_for_sel + picked):
+                            c2 = np.asarray(c2, dtype=np.float64).reshape(3)
+                            if float(np.linalg.norm(cc - c2)) < (rr + float(r2) + 2.0 * safe_margin):
+                                ok_sep = False
+                                break
+                        if not ok_sep:
+                            continue
+                        # score: distance to nearest already-picked/existing center
+                        pts = [np.asarray(c2, dtype=np.float64).reshape(3) for c2, _r2 in (existing_for_sel + picked)]
+                        if len(pts) == 0:
+                            score = float("inf")
+                        else:
+                            score = float(min(float(np.linalg.norm(cc - p)) for p in pts))
+                        if score > best_score:
+                            best_score = score
+                            best_i = ci
+                    if best_i is None:
+                        break
+                    picked.append(pool.pop(int(best_i)))
+                global_spheres = list(picked)
+                if len(global_spheres) < int(n_global):
+                    # Keep total_n exact: resample this iteration rather than returning fewer obstacles.
+                    continue
+
+            # Detour feasibility check (lightweight): require a simple left/right mid-offset polyline to be safe.
+            spheres_all = list(base_spheres) + list(corridor_spheres) + list(global_spheres)
+            r_block = float(max([float(r) for _c, r in corridor_spheres])) if len(corridor_spheres) > 0 else float(r_lo)
+            if detour_offset_user > 0.0:
+                detour_off = float(detour_offset_user)
+            else:
+                detour_off = float(corr_r + r_block + safe_margin + 0.05)
+
+            detour_ok = True
+            detour_best = float("inf")
+            # Require a detour per baseline segment (for mid-mode this checks both start->mid and mid->goal).
+            pts = baseline_poly
+            for si in range(pts.shape[0] - 1):
+                a_seg = pts[si]
+                b_seg = pts[si + 1]
+                vdir = (b_seg - a_seg).astype(np.float64)
+                n1_seg, n2_seg = _perp_basis_from_dir(vdir)
+                if (n1_seg is None) or (n2_seg is None):
+                    detour_ok = False
+                    detour_best = -float("inf")
+                    break
+                mid_base = 0.5 * (a_seg + b_seg)
+                seg_best = -float("inf")
+                for sgn in (+1.0, -1.0):
+                    mid = mid_base + float(sgn) * detour_off * np.asarray(n1_seg, dtype=np.float64)
+                    # Ensure mid lies within bounds (with a small margin).
+                    margin_mid = float(max(safe_margin, 0.02))
+                    lo_mid = np.asarray(global_min, dtype=np.float64).reshape(3) + margin_mid
+                    hi_mid = np.asarray(global_max, dtype=np.float64).reshape(3) - margin_mid
+                    if np.any(mid < lo_mid) or np.any(mid > hi_mid):
+                        clr_det = -float("inf")
+                    else:
+                        clr_det = _polyline_min_clearance_to_spheres(
+                            poly_xyz=np.stack([a_seg, mid, b_seg], axis=0),
+                            spheres=spheres_all,
+                            uav_radius=uav_r,
+                        )
+                    seg_best = max(seg_best, float(clr_det))
+                detour_best = min(float(detour_best), float(seg_best))
+                if seg_best < float(safe_margin + detour_buffer):
+                    detour_ok = False
+                    break
+
+            if detour_best > best_detour:
+                best_detour = float(detour_best)
+                best_baseline = float(baseline_clr)
+                best_corr = list(corridor_spheres)
+                best_global = list(global_spheres)
+
+            if detour_ok:
+                best_corr = list(corridor_spheres)
+                best_global = list(global_spheres)
+                best_baseline = float(baseline_clr)
+                break
+
+        if (best_corr is not None) and (len(best_corr) == int(n_corr)):
+            corridor_spheres = list(best_corr)
+            baseline_clr = float(best_baseline)
+            global_spheres = list(best_global or [])
+            if best_detour > -float("inf"):
+                case_meta["obst_detour_clr_best"] = float(best_detour)
+        else:
+            print(f"[OBST_CORRIDOR_WARN] case={idx:04d} failed to sample corridor spheres (n_corr={n_corr})")
+            global_spheres = []
+
+        case_spheres = list(base_spheres) + list(corridor_spheres) + list(global_spheres)
+        case_sphere_from_box = list(base_box_flags) + ([0] * (len(case_spheres) - len(base_spheres)))
+        case_boxes = []
+
+        blocking_mask = np.zeros((len(case_spheres),), dtype=np.int64)
+        if len(corridor_spheres) > 0:
+            blocking_mask[len(base_spheres) : len(base_spheres) + len(corridor_spheres)] = 1
+
+        case_meta.update(
+            dict(
+                obst_mode="corridor_block4",
+                obst_total_n=int(total_n),
+                obst_corridor_n=int(n_corr),
+                obst_global_n=int(n_global),
+                obst_corridor_radius=float(corr_r),
+                obst_baseline_clr_min=float(baseline_clr),
+                obst_blocking_mask=blocking_mask,
+                obst_block_thr=float(block_thr),
+                obst_force_block_alpha=float(block_alpha),
+                obst_force_block_min_clr=float(block_min_clr),
+                obst_force_block_upper=float(block_upper),
+            )
+        )
+        print(
+            f"[OBST_MODE] case={idx:04d} mode=corridor_block4 total_n={int(total_n)} "
+            f"size_scale={float(size_scale):.3f} corridor_n={int(n_corr)} global_n={int(n_global)} "
+            f"baseline_clr_min={float(baseline_clr):.6f} block_upper={float(block_upper):.6f} safe_margin={float(safe_margin):.6f}"
+        )
+        for i, (c, r) in enumerate(corridor_spheres):
+            print(f"[OBST_CORRIDOR] case={idx:04d} i={i} center={np.asarray(c).reshape(3).tolist()} r={float(r):.4f}")
+        for i, (c, r) in enumerate(global_spheres):
+            print(f"[OBST_GLOBAL]   case={idx:04d} i={i} center={np.asarray(c).reshape(3).tolist()} r={float(r):.4f}")
+
+        return case_spheres, case_sphere_from_box, case_boxes, scene_min, scene_max, case_meta
+
     global_span = np.maximum(global_max - global_min, 1e-6)
     global_vol = float(np.prod(global_span))
 
@@ -1166,8 +2287,8 @@ def sample_obstacles_with_anchor_clearance(
                             n_spheres=int(n_try),
                             xyz_min=bmin,
                             xyz_max=bmax,
-                            r_min=float(args.obst_random_r_min),
-                            r_max=float(args.obst_random_r_max),
+                            r_min=float(r_min_eff),
+                            r_max=float(r_max_eff),
                             seed=int(rand_seed_case + 1009 * p_i),
                             anchor_points=anchor_points_clr_np,
                             anchor_clearance=anchor_clearance_eff,
@@ -1223,8 +2344,8 @@ def sample_obstacles_with_anchor_clearance(
                             n_boxes=int(n_try),
                             xyz_min=bmin,
                             xyz_max=bmax,
-                            half_min=rand_box_half_min,
-                            half_max=rand_box_half_max,
+                            half_min=half_min_eff,
+                            half_max=half_max_eff,
                             seed=int(box_seed_case + 1009 * p_i),
                             anchor_points=anchor_points_clr_np,
                             anchor_clearance=anchor_clearance_eff,
@@ -1330,7 +2451,7 @@ def sample_obstacles_with_anchor_clearance(
         f"local_min={anchor_min.tolist()} local_max={anchor_max.tolist()}"
     )
 
-    return case_spheres, case_sphere_from_box, case_boxes, scene_min, scene_max
+    return case_spheres, case_sphere_from_box, case_boxes, scene_min, scene_max, case_meta
 
 
 def _build_xyz_reference_paths(
@@ -1395,6 +2516,8 @@ def main():
     ap.add_argument("--ckpt", type=str, required=True)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--n_cases", type=int, default=20)
+    ap.add_argument("--case_start", type=int, default=0,
+                    help="Dataset index offset for evaluation. case_id in outputs will start from this value.")
     ap.add_argument("--n_samples", type=int, default=25)
     ap.add_argument("--save_dir", type=str, default="eval_out")
     ap.add_argument("--H", type=int, default=144)
@@ -1483,6 +2606,8 @@ def main():
                     help="Reward weight for straight_ratio in obstacle-aware sample selection.")
     ap.add_argument("--obst_select_max_len_ratio", type=float, default=2.6,
                     help="Candidate filter by path_len/straight_len (<=0 to disable).")
+    ap.add_argument("--obst_select_debug_topk", type=int, default=5,
+                    help="Print top-K selection candidates with kappa/d2/turn metrics (0 to disable).")
     ap.add_argument("--obst_shortcut_enable", action="store_true",
                     help="Apply post-selection xyz shortcut on best sample.")
     ap.add_argument("--obst_shortcut_iter", type=int, default=200,
@@ -1526,6 +2651,10 @@ def main():
                     help="Maximum allowed turning angle (deg) before hinge penalty.")
     ap.add_argument("--obst_proj_w_uav_curv", type=float, default=20.0,
                     help="UAV xyz curvature (2nd-diff) penalty weight in post projection.")
+    ap.add_argument("--obst_proj_w_uav_curv_hard", type=float, default=0.0,
+                    help="Hinge penalty weight on ||D2 xyz|| spikes: w*relu(||D2||-d2_max)^2. (0 disables)")
+    ap.add_argument("--obst_proj_uav_curv_d2_max", type=float, default=0.0,
+                    help="Threshold (meters) for the ||D2 xyz|| hinge term in post projection (<=0 disables).")
     ap.add_argument("--obst_proj_prog_eps", type=float, default=0.0,
                     help="Minimum progress epsilon along start-goal line for backtracking penalty.")
     ap.add_argument("--obst_proj_cgd_shift_step", type=float, default=0.02,
@@ -1562,6 +2691,43 @@ def main():
     # MPD-style random obstacle generation
     ap.add_argument("--obst_random_enable", action="store_true",
                     help="Append randomly sampled spheres per case (MPD-style).")
+    ap.add_argument(
+        "--obst_mode",
+        type=str,
+        default="random",
+        choices=["random", "corridor_block4"],
+        help="Obstacle sampling mode: 'random' uses existing random/mix sampler; 'corridor_block4' forces 4 obstacles with 2 blocking the start->goal corridor.",
+    )
+    ap.add_argument("--obst_total_n", type=int, default=4,
+                    help="Total number of REAL obstacles to sample (used by corridor_block4).")
+    ap.add_argument("--obst_size_scale", type=float, default=1.0,
+                    help="Scale sampled obstacle sizes in the REAL environment (sphere radius and box half-extents).")
+    ap.add_argument("--obst_corridor_radius", type=float, default=0.4,
+                    help="Max perpendicular offset from start->goal line for corridor-blocking obstacles.")
+    ap.add_argument("--obst_corridor_n", type=int, default=2,
+                    help="Number of corridor-blocking obstacles inside total_n (corridor_block4).")
+    ap.add_argument("--obst_corridor_s_min", type=float, default=0.25,
+                    help="Min segment fraction s for corridor obstacle placement (start + s*(goal-start)).")
+    ap.add_argument("--obst_corridor_s_max", type=float, default=0.75,
+                    help="Max segment fraction s for corridor obstacle placement (start + s*(goal-start)).")
+    ap.add_argument("--obst_corridor_start_goal_buffer", type=float, default=0.08,
+                    help="Extra buffer to keep corridor obstacles away from start/goal (in addition to r+uav_r+safe_margin).")
+    ap.add_argument("--obst_corridor_resample_max", type=int, default=50,
+                    help="Max resampling tries for corridor obstacles to force baseline unsafe.")
+    ap.add_argument("--obst_force_block_thr", type=float, default=-1.0,
+                    help="Baseline blocking threshold in meters. If <0, uses --obst_safe_margin.")
+    ap.add_argument("--obst_force_block_alpha", type=float, default=0.6,
+                    help="For corridor_block4: force baseline clearance < alpha*safe_margin (unsafe but not too aggressive).")
+    ap.add_argument("--obst_force_block_min_clr", type=float, default=0.02,
+                    help="For corridor_block4: force baseline clearance >= min_clr (avoid forcing baseline collision).")
+    ap.add_argument("--obst_detour_offset", type=float, default=-1.0,
+                    help="For corridor_block4: detour mid offset magnitude. If <=0, auto = corridor_radius + r_block + safe_margin + 0.05.")
+    ap.add_argument("--obst_detour_buffer", type=float, default=0.02,
+                    help="For corridor_block4: require a simple 2-segment detour with clr >= safe_margin + buffer.")
+    ap.add_argument("--obst_uav_radius", type=float, default=0.0,
+                    help="UAV radius (meters) used for clearance computations in corridor blocking checks and saved NPZ.")
+    ap.add_argument("--obst_effect_check", action="store_true",
+                    help="Run a strong A/B comparison per case: obstacle influence ON vs OFF (same obstacles/seed).")
     ap.add_argument("--obst_random_n", type=int, default=12,
                     help="Number of random spheres sampled per case.")
     ap.add_argument("--obst_random_n_min", type=int, default=0,
@@ -1657,6 +2823,93 @@ def main():
     ap.add_argument("--obst_pc_radius", type=float, default=0.02)
     ap.add_argument("--obst_pc_max_points", type=int, default=256)
     ap.add_argument("--obst_pc_seed_offset", type=int, default=0)
+
+    # Optional: time scaling (geometry fixed, only time parameterization changes).
+    ap.add_argument("--traj_time_enable", dest="traj_time_enable", action="store_true",
+                    help="Compute and save traj_time/traj_speed/traj_acc for each sampled trajectory.")
+    ap.add_argument("--traj_time_disable", dest="traj_time_enable", action="store_false",
+                    help="Disable saving traj_time/traj_speed/traj_acc.")
+    ap.set_defaults(traj_time_enable=True)
+    ap.add_argument("--traj_time_v_free", type=float, default=1.0,
+                    help="Free-space speed used by time scaling (m/s). (<=0 for auto=1.0)")
+    ap.add_argument("--traj_time_v_max", type=float, default=-1.0,
+                    help="Absolute max speed (<=0 means v_free).")
+    ap.add_argument("--traj_time_v_min_ratio", type=float, default=0.05,
+                    help="Minimum speed ratio relative to v_free to keep dt finite.")
+    ap.add_argument("--traj_time_a_max", type=float, default=3.0,
+                    help="Longitudinal accel limit for forward/backward pass (m/s^2). (<=0 for auto=1.0)")
+    ap.add_argument("--traj_time_a_lat_max", type=float, default=-1.0,
+                    help="Lateral accel limit for curvature speed cap (<=0 for auto).")
+    # Goal/grasp speed cap. Default uses a C1-continuous smoothstep ramp for more natural slowdown/accel.
+    ap.add_argument(
+        "--traj_time_goal_mode",
+        type=str,
+        default="smoothstep",
+        choices=["smoothstep", "clamp", "sigmoid", "valley", "none"],
+        help=(
+            "Goal/grasp speed cap mode. "
+            "'smoothstep' slows down smoothly (C1) as dist_to_grasp decreases; "
+            "'clamp'/'sigmoid' are monotone ramps; "
+            "'valley' creates a bell-shaped speed valley around closest grasp then speeds up after leaving; "
+            "'none' disables grasp-based speed cap."
+        ),
+    )
+    ap.add_argument("--traj_time_goal_sigma", type=float, default=0.25,
+                    help="Gaussian valley sigma (meters along arc length) when --traj_time_goal_mode=valley.")
+    # Tune defaults to avoid a hard low-speed plateau near grasp:
+    # smaller d_stop and larger d_full make the decel/accel ramp longer and more gradual (closer to "Fig2" feel).
+    ap.add_argument("--traj_time_goal_d_stop", type=float, default=0.04,
+                    help="(smoothstep) dist_to_grasp <= d_stop -> v_cap_goal=v_min (m).")
+    ap.add_argument("--traj_time_goal_d_full", type=float, default=0.60,
+                    help="(smoothstep) dist_to_grasp >= d_full -> v_cap_goal=v_free (m).")
+    ap.add_argument(
+        "--traj_time_goal_v_min", "--traj_time_v_min_goal",
+        dest="traj_time_goal_v_min", type=float, default=0.10,
+        help="Minimum speed near grasp target (m/s). (Deprecated alias: --traj_time_v_min_goal)",
+    )
+    # Legacy parameters (still supported for clamp/sigmoid): d_stop + k => d_full.
+    ap.add_argument("--traj_time_goal_r_stop", type=float, default=0.20,
+                    help="EE distance (m) below which we start slowing down for grasp proximity.")
+    ap.add_argument("--traj_time_goal_k", type=float, default=0.05,
+                    help="Grasp proximity scale (m): for mode=sigmoid, the sigmoid scale; for mode=clamp, the ramp length "
+                         "(d_full = d_stop + k).")
+    ap.add_argument("--traj_time_obs_clr0_factor", type=float, default=2.0,
+                    help="Obstacle speed-cap sigmoid center clr0 = obs_clr0_factor * safe_margin.")
+    ap.add_argument("--traj_time_obs_clr_k_factor", type=float, default=0.5,
+                    help="Obstacle speed-cap sigmoid scale k = obs_clr_k_factor * max(safe_margin,0.05).")
+    ap.add_argument("--traj_time_dt_min", type=float, default=1e-4,
+                    help="Clamp dt per segment to be >= dt_min (seconds).")
+    ap.add_argument("--traj_time_dt_max", type=float, default=10.0,
+                    help="Clamp dt per segment to be <= dt_max (seconds).")
+    ap.add_argument("--traj_time_kappa_ref_p", type=float, default=95.0,
+                    help="Percentile of curvature used for auto a_lat_max.")
+    ap.add_argument(
+        "--traj_time_cap_smooth_window",
+        type=int,
+        default=9,
+        help=(
+            "Moving-average window applied to the final speed cap v_cap BEFORE accel pass. "
+            "We enforce v_cap_smoothed = min(smooth(v_cap_raw), v_cap_raw), so it can only slow down (never speed up). "
+            "Set <=1 to disable."
+        ),
+    )
+    ap.add_argument(
+        "--traj_time_j_max",
+        type=float,
+        default=0.0,
+        help="Optional jerk limit (m/s^3). <=0 disables. If enabled, we run a few projection iterations to smooth |v|(t).",
+    )
+    ap.add_argument("--traj_time_j_iters", type=int, default=3,
+                    help="Iterations for jerk limiting when --traj_time_j_max > 0.")
+    ap.add_argument("--traj_time_debug", action="store_true",
+                    help="Print debug stats for time scaling on the selected best trajectory.")
+    ap.add_argument("--traj_exec_enable", dest="traj_exec_enable", action="store_true",
+                    help="After traj_time is computed, export executable uniform-dt setpoints traj_exec_time/xyz/vel.")
+    ap.add_argument("--traj_exec_disable", dest="traj_exec_enable", action="store_false",
+                    help="Disable exporting traj_exec_* arrays.")
+    ap.set_defaults(traj_exec_enable=True)
+    ap.add_argument("--traj_exec_dt", type=float, default=0.02,
+                    help="Control cycle for executable resampling (seconds).")
 
     parser_defaults = {a.dest: ap.get_default(a.dest) for a in ap._actions if getattr(a, "dest", None)}
     args = ap.parse_args()
@@ -1951,7 +3204,10 @@ def main():
     else:
         print("[INFO] no_wrap_patch=True: skip patch_all_cond_encoders")
 
-    n_cases = min(args.n_cases, len(dataset))
+    case_start = int(max(0, int(getattr(args, "case_start", 0))))
+    if case_start >= len(dataset):
+        raise ValueError(f"[ERR] case_start={case_start} out of range for dataset len={len(dataset)}")
+    n_cases = int(min(int(args.n_cases), int(len(dataset) - case_start)))
 
     best_start = []
     best_goal = []
@@ -1971,7 +3227,8 @@ def main():
 
     printed_ctx_once = False
 
-    for idx in range(n_cases):
+    for local_i in range(n_cases):
+        idx = int(case_start + local_i)
         data_sample = dataset[idx]
 
         data_cpu = {k: (v.detach().cpu() if torch.is_tensor(v) else v) for k, v in data_sample.items()}
@@ -2092,6 +3349,7 @@ def main():
         case_spheres = []
         case_sphere_from_box = []
         case_boxes = []
+        case_obst_meta = {}
         scene_min = rand_xyz_min
         scene_max = rand_xyz_max
         if args.obst_enable:
@@ -2105,7 +3363,7 @@ def main():
                 q_grasp_arr = np.asarray(q_grasp_np, dtype=np.float32).reshape(-1)
                 if q_grasp_arr.shape[0] >= 3:
                     mid_xyz_np = q_grasp_arr[:3]
-            case_spheres, case_sphere_from_box, case_boxes, scene_min, scene_max = sample_obstacles_with_anchor_clearance(
+            case_spheres, case_sphere_from_box, case_boxes, scene_min, scene_max, case_obst_meta = sample_obstacles_with_anchor_clearance(
                 args=args,
                 idx=idx,
                 mode=args.mode,
@@ -2130,41 +3388,7 @@ def main():
                 )
                 print(f"[OBST_SCENE] case={idx:04d} scene_min={scene_min.tolist()} scene_max={scene_max.tolist()}")
 
-        # =================== run inference ===================
-        all_cp_norm = []
-        all_tag = []
-        obstacle_cfg_case = None
-        if args.obst_enable:
-            obstacle_cfg_case = build_obstacle_cfg_from_args(args, case_spheres)
-
-        for t_g in t_g_list:
-            if args.mode == "endpoints_and_mid_hard":
-                hard_conds_t = {0: q_start_hc_1d, H - 1: q_goal_hc_1d, int(t_g): q_g_hc_1d}
-            else:
-                hard_conds_t = hard_conds if hard_conds is not None else {}
-
-            context_d_tg = {}
-            for k, v in context_d.items():
-                if torch.is_tensor(v):
-                    context_d_tg[k] = _context_to_batch(v, per_tg)
-                else:
-                    context_d_tg[k] = v
-
-            diffusion_kwargs = {}
-            obstacle_cfg_tg = obstacle_cfg_case
-
-            cp_norm_tg = model.run_inference(
-                context_d=context_d_tg,
-                hard_conds=hard_conds_t,
-                n_samples=per_tg,
-                horizon=H,
-                obstacle_cfg=obstacle_cfg_tg,
-                **diffusion_kwargs,
-            )
-            all_cp_norm.append(cp_norm_tg)
-            all_tag.append(torch.full((cp_norm_tg.shape[0],), -1 if t_g is None else int(t_g),
-                                      device="cpu", dtype=torch.int64))
-
+        # =================== run inference (+ optional effect check) ===================
         anchor_feasible = True
         anchor_clr_min = float("inf")
         if args.obst_enable and len(case_spheres) > 0:
@@ -2176,521 +3400,1041 @@ def main():
             if not anchor_feasible:
                 print(f"[OBST_INFEASIBLE] case={idx:04d} hard_anchor_clr_min={anchor_clr_min:.6f} (collision at constrained waypoint)")
 
-        cp_norm = torch.cat(all_cp_norm, dim=0)
-        tag_tg = torch.cat(all_tag, dim=0)
+        if args.obst_enable:
+            _m = str(case_obst_meta.get("obst_mode", str(getattr(args, "obst_mode", ""))))
+            _n = int(case_obst_meta.get("obst_total_n", int(getattr(args, "obst_total_n", 4))))
+            _s = float(case_obst_meta.get("obst_size_scale", float(getattr(args, "obst_size_scale", 1.0))))
+            print(f"[OBST_META] case={idx:04d} obst_mode={_m} total_n={_n} size_scale={_s:.3f}")
 
-        cp = dataset.unnormalize_control_points(cp_norm)
+        def _seed_all(seed_val: int):
+            seed_val = int(seed_val)
+            random.seed(seed_val)
+            np.random.seed(seed_val)
+            torch.manual_seed(seed_val)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed_val)
 
-        if cp.shape[-1] == 5:
-            cp5_np = cp.detach().cpu().numpy()
-            cp9_np = np.stack(
-                [traj5_to_traj9(cp5_np[i], q_start_np, q_goal_np) for i in range(cp5_np.shape[0])],
-                axis=0
-            )
-            cp = torch.as_tensor(cp9_np, device=cp.device, dtype=torch.float32)
-        elif cp.shape[-1] != 9:
-            raise ValueError(f"[ERR] Unexpected cp last-dim={cp.shape[-1]} with shape={tuple(cp.shape)}")
+        def _run_one_pass(obst_influence_enable: bool, out_suffix: str, label: str):
+            # Reset RNG so ON/OFF are comparable (same initial noise); obstacle influence is the only change.
+            base_seed = int(args.seed) * 100000 + int(idx) * 97 + 13
+            _seed_all(base_seed)
 
-        cp_np_raw = None
-        if args.obst_enable and args.obst_project_enable and len(case_spheres) > 0:
-            cp_raw = cp.detach().clone()
-            S_proj = int(cp.shape[0])
-            hard_mask = torch.zeros((S_proj, H), dtype=torch.bool, device=cp.device)
-            hard_mask[:, 0] = True
-            hard_mask[:, H - 1] = True
-            tag_np = tag_tg.detach().cpu().numpy().astype(np.int64)
-            for s_i, tgi in enumerate(tag_np.tolist()):
-                if 0 <= int(tgi) < H:
-                    hard_mask[s_i, int(tgi)] = True
-            ref_mid_xyz = np.asarray(q_g_np[:3], dtype=np.float32) if args.mode == "endpoints_and_mid_hard" else None
-            ref_xyz_np, straight_len_vec_np = _build_xyz_reference_paths(
-                start_xyz=np.asarray(q_start_np[:3], dtype=np.float32),
-                goal_xyz=np.asarray(q_goal_np[:3], dtype=np.float32),
-                mid_xyz=ref_mid_xyz,
-                tag_tg_np=tag_np,
-                horizon=H,
-            )
-            ref_xyz_t = torch.as_tensor(ref_xyz_np, dtype=cp.dtype, device=cp.device)
-            straight_len_t = torch.as_tensor(straight_len_vec_np, dtype=cp.dtype, device=cp.device)
+            all_cp_norm = []
+            all_tag = []
+            obstacle_cfg_case = None
+            if args.obst_enable and obst_influence_enable:
+                obstacle_cfg_case = build_obstacle_cfg_from_args(args, case_spheres)
 
-            proj_cfg = dict(obstacle_cfg_case["project"]) if (obstacle_cfg_case is not None) else {}
-            if (obstacle_cfg_case is not None) and ("_proj_cfg_printed" in obstacle_cfg_case["project"]):
-                proj_cfg["_proj_cfg_printed"] = bool(obstacle_cfg_case["project"]["_proj_cfg_printed"])
-            proj_cfg["ref_xyz"] = ref_xyz_t
-            proj_cfg["straight_len"] = straight_len_t
-            q_start_proj_t = torch.as_tensor(
-                np.repeat(np.asarray(q_start_np[:3], dtype=np.float32).reshape(1, 3), S_proj, axis=0),
-                dtype=cp.dtype,
-                device=cp.device,
-            )
-            q_goal_proj_t = torch.as_tensor(
-                np.repeat(np.asarray(q_goal_np[:3], dtype=np.float32).reshape(1, 3), S_proj, axis=0),
-                dtype=cp.dtype,
-                device=cp.device,
-            )
-            proj_cfg["q_start_xyz"] = q_start_proj_t
-            proj_cfg["q_goal_xyz"] = q_goal_proj_t
-            if args.mode == "endpoints_and_mid_hard":
-                q_grasp_proj_t = torch.as_tensor(
-                    np.repeat(np.asarray(q_g_np[:3], dtype=np.float32).reshape(1, 3), S_proj, axis=0),
+            for t_g in t_g_list:
+                if args.mode == "endpoints_and_mid_hard":
+                    hard_conds_t = {0: q_start_hc_1d, H - 1: q_goal_hc_1d, int(t_g): q_g_hc_1d}
+                else:
+                    hard_conds_t = hard_conds if hard_conds is not None else {}
+
+                context_d_tg = {}
+                for k, v in context_d.items():
+                    if torch.is_tensor(v):
+                        context_d_tg[k] = _context_to_batch(v, per_tg)
+                    else:
+                        context_d_tg[k] = v
+
+                diffusion_kwargs = {}
+                obstacle_cfg_tg = obstacle_cfg_case if (args.obst_enable and obst_influence_enable) else None
+
+                cp_norm_tg = model.run_inference(
+                    context_d=context_d_tg,
+                    hard_conds=hard_conds_t,
+                    n_samples=per_tg,
+                    horizon=H,
+                    obstacle_cfg=obstacle_cfg_tg,
+                    **diffusion_kwargs,
+                )
+                all_cp_norm.append(cp_norm_tg)
+                all_tag.append(torch.full((cp_norm_tg.shape[0],), -1 if t_g is None else int(t_g),
+                                          device="cpu", dtype=torch.int64))
+
+            cp_norm = torch.cat(all_cp_norm, dim=0)
+            tag_tg = torch.cat(all_tag, dim=0)
+
+            cp = dataset.unnormalize_control_points(cp_norm)
+
+            if cp.shape[-1] == 5:
+                cp5_np = cp.detach().cpu().numpy()
+                cp9_np = np.stack(
+                    [traj5_to_traj9(cp5_np[i], q_start_np, q_goal_np) for i in range(cp5_np.shape[0])],
+                    axis=0
+                )
+                cp = torch.as_tensor(cp9_np, device=cp.device, dtype=torch.float32)
+            elif cp.shape[-1] != 9:
+                raise ValueError(f"[ERR] Unexpected cp last-dim={cp.shape[-1]} with shape={tuple(cp.shape)}")
+
+            cp_np_raw = None
+            if args.obst_enable and obst_influence_enable and args.obst_project_enable and len(case_spheres) > 0:
+                cp_raw = cp.detach().clone()
+                S_proj = int(cp.shape[0])
+                hard_mask = torch.zeros((S_proj, H), dtype=torch.bool, device=cp.device)
+                hard_mask[:, 0] = True
+                hard_mask[:, H - 1] = True
+                tag_np = tag_tg.detach().cpu().numpy().astype(np.int64)
+                for s_i, tgi in enumerate(tag_np.tolist()):
+                    if 0 <= int(tgi) < H:
+                        hard_mask[s_i, int(tgi)] = True
+                ref_mid_xyz = np.asarray(q_g_np[:3], dtype=np.float32) if args.mode == "endpoints_and_mid_hard" else None
+                ref_xyz_np, straight_len_vec_np = _build_xyz_reference_paths(
+                    start_xyz=np.asarray(q_start_np[:3], dtype=np.float32),
+                    goal_xyz=np.asarray(q_goal_np[:3], dtype=np.float32),
+                    mid_xyz=ref_mid_xyz,
+                    tag_tg_np=tag_np,
+                    horizon=H,
+                )
+                ref_xyz_t = torch.as_tensor(ref_xyz_np, dtype=cp.dtype, device=cp.device)
+                straight_len_t = torch.as_tensor(straight_len_vec_np, dtype=cp.dtype, device=cp.device)
+
+                proj_cfg = dict(obstacle_cfg_case["project"]) if (obstacle_cfg_case is not None) else {}
+                if (obstacle_cfg_case is not None) and ("_proj_cfg_printed" in obstacle_cfg_case["project"]):
+                    proj_cfg["_proj_cfg_printed"] = bool(obstacle_cfg_case["project"]["_proj_cfg_printed"])
+                proj_cfg["ref_xyz"] = ref_xyz_t
+                proj_cfg["straight_len"] = straight_len_t
+                q_start_proj_t = torch.as_tensor(
+                    np.repeat(np.asarray(q_start_np[:3], dtype=np.float32).reshape(1, 3), S_proj, axis=0),
                     dtype=cp.dtype,
                     device=cp.device,
                 )
-                t_mid_np = np.asarray(tag_np, dtype=np.int64).reshape(-1)
-                t_mid_np = np.where((t_mid_np >= 1) & (t_mid_np <= H - 2), t_mid_np, H // 2)
-                proj_cfg["q_grasp_xyz"] = q_grasp_proj_t
-                proj_cfg["t_mid_idx"] = torch.as_tensor(t_mid_np, dtype=torch.long, device=cp.device)
+                q_goal_proj_t = torch.as_tensor(
+                    np.repeat(np.asarray(q_goal_np[:3], dtype=np.float32).reshape(1, 3), S_proj, axis=0),
+                    dtype=cp.dtype,
+                    device=cp.device,
+                )
+                proj_cfg["q_start_xyz"] = q_start_proj_t
+                proj_cfg["q_goal_xyz"] = q_goal_proj_t
+                if args.mode == "endpoints_and_mid_hard":
+                    q_grasp_proj_t = torch.as_tensor(
+                        np.repeat(np.asarray(q_g_np[:3], dtype=np.float32).reshape(1, 3), S_proj, axis=0),
+                        dtype=cp.dtype,
+                        device=cp.device,
+                    )
+                    t_mid_np = np.asarray(tag_np, dtype=np.int64).reshape(-1)
+                    t_mid_np = np.where((t_mid_np >= 1) & (t_mid_np <= H - 2), t_mid_np, H // 2)
+                    proj_cfg["q_grasp_xyz"] = q_grasp_proj_t
+                    proj_cfg["t_mid_idx"] = torch.as_tensor(t_mid_np, dtype=torch.long, device=cp.device)
 
-            def _proj_verbose(msg):
-                s = str(msg)
-                if s.startswith("[OBST_PROJ_CFG]"):
-                    if idx == 0:
+                def _proj_verbose(msg):
+                    s = str(msg)
+                    if s.startswith("[OBST_PROJ_CFG]"):
+                        if idx == 0:
+                            print(s)
+                    else:
                         print(s)
-                else:
-                    print(s)
 
-            cp, _ = apply_obstacle_projection_with_adaptive(
-                traj=cp,
-                hard_mask=hard_mask,
-                spheres=case_spheres if len(case_spheres) > 0 else [],
-                proj_cfg=proj_cfg,
-                verbose_fn=_proj_verbose,
-            )
-            if obstacle_cfg_case is not None:
-                obstacle_cfg_case["project"]["_proj_cfg_printed"] = bool(proj_cfg.get("_proj_cfg_printed", False))
+                cp, _ = apply_obstacle_projection_with_adaptive(
+                    traj=cp,
+                    hard_mask=hard_mask,
+                    spheres=case_spheres if len(case_spheres) > 0 else [],
+                    proj_cfg=proj_cfg,
+                    verbose_fn=_proj_verbose,
+                )
+                if obstacle_cfg_case is not None:
+                    obstacle_cfg_case["project"]["_proj_cfg_printed"] = bool(proj_cfg.get("_proj_cfg_printed", False))
 
-            cp_np_raw = cp_raw.detach().cpu().numpy()
+                cp_np_raw = cp_raw.detach().cpu().numpy()
 
-        cp_np = cp.detach().cpu().numpy()
+            cp_np = cp.detach().cpu().numpy()
 
-        start_pos_gt = np.asarray(q_start_np[:3], dtype=np.float64)
-        goal_pos_gt = np.asarray(q_goal_np[:3], dtype=np.float64)
+            start_pos_gt = np.asarray(q_start_np[:3], dtype=np.float64)
+            goal_pos_gt = np.asarray(q_goal_np[:3], dtype=np.float64)
 
-        if args.dbg_eval and idx == 0:
-            xyz = cp_np[:, :, :3]
-            xyz_min = xyz.min(axis=(0, 1))
-            xyz_max = xyz.max(axis=(0, 1))
-            print("[DBG_EVAL] start_xyz(gt):", start_pos_gt)
-            print("[DBG_EVAL] goal_xyz (gt):", goal_pos_gt)
-            print("[DBG_EVAL] pred_xyz range: min", xyz_min, "max", xyz_max)
-            for s_show in [0, min(1, cp_np.shape[0]-1)]:
-                p0 = cp_np[s_show, 0, :3]
-                pT = cp_np[s_show, -1, :3]
-                print(f"[DBG_EVAL] sample{s_show:02d} traj0_xyz={p0} trajT_xyz={pT} "
-                      f"|e0|={np.linalg.norm(p0-start_pos_gt):.4f} |eT|={np.linalg.norm(pT-goal_pos_gt):.4f}")
+            if args.dbg_eval and idx == 0:
+                xyz = cp_np[:, :, :3]
+                xyz_min = xyz.min(axis=(0, 1))
+                xyz_max = xyz.max(axis=(0, 1))
+                print("[DBG_EVAL] start_xyz(gt):", start_pos_gt)
+                print("[DBG_EVAL] goal_xyz (gt):", goal_pos_gt)
+                print("[DBG_EVAL] pred_xyz range: min", xyz_min, "max", xyz_max)
+                for s_show in [0, min(1, cp_np.shape[0]-1)]:
+                    p0 = cp_np[s_show, 0, :3]
+                    pT = cp_np[s_show, -1, :3]
+                    print(f"[DBG_EVAL] sample{s_show:02d} traj0_xyz={p0} trajT_xyz={pT} "
+                          f"|e0|={np.linalg.norm(p0-start_pos_gt):.4f} |eT|={np.linalg.norm(pT-goal_pos_gt):.4f}")
 
-        S = cp_np.shape[0]
-        start_errs = np.zeros((S,), dtype=np.float64)
-        goal_errs  = np.zeros((S,), dtype=np.float64)
-        grasp_errs = np.zeros((S,), dtype=np.float64)
+            S = cp_np.shape[0]
+            start_errs = np.zeros((S,), dtype=np.float64)
+            goal_errs  = np.zeros((S,), dtype=np.float64)
+            grasp_errs = np.zeros((S,), dtype=np.float64)
 
-        uav_a_mean = np.zeros((S,), dtype=np.float64)
-        uav_j_mean = np.zeros((S,), dtype=np.float64)
-        yaw_a_mean = np.zeros((S,), dtype=np.float64)
-        arm_a_mean = np.zeros((S,), dtype=np.float64)
-        path_len = np.zeros((S,), dtype=np.float64)
-        path_ratio = np.ones((S,), dtype=np.float64)
-        turn_xy = np.zeros((S,), dtype=np.float64)
-        straight_ratio = np.zeros((S,), dtype=np.float64)
-        obst_clr_min = np.full((S,), np.inf, dtype=np.float64)
-        if args.mode == "endpoints_and_mid_hard":
-            mid_pos_gt = np.asarray(q_g_np[:3], dtype=np.float64)
-            straight_len = float(
-                np.linalg.norm(mid_pos_gt - start_pos_gt) + np.linalg.norm(goal_pos_gt - mid_pos_gt)
-            )
-        else:
-            straight_len = float(np.linalg.norm(goal_pos_gt - start_pos_gt))
-        straight_len = max(straight_len, 1e-6)
+            uav_a_mean = np.zeros((S,), dtype=np.float64)
+            uav_j_mean = np.zeros((S,), dtype=np.float64)
+            yaw_a_mean = np.zeros((S,), dtype=np.float64)
+            arm_a_mean = np.zeros((S,), dtype=np.float64)
+            path_len = np.zeros((S,), dtype=np.float64)
+            path_ratio = np.ones((S,), dtype=np.float64)
+            turn_xy = np.zeros((S,), dtype=np.float64)
+            straight_ratio = np.zeros((S,), dtype=np.float64)
+            obst_clr_min = np.full((S,), np.inf, dtype=np.float64)
+            if args.mode == "endpoints_and_mid_hard":
+                mid_pos_gt = np.asarray(q_g_np[:3], dtype=np.float64)
+                straight_len = float(
+                    np.linalg.norm(mid_pos_gt - start_pos_gt) + np.linalg.norm(goal_pos_gt - mid_pos_gt)
+                )
+            else:
+                straight_len = float(np.linalg.norm(goal_pos_gt - start_pos_gt))
+            straight_len = max(straight_len, 1e-6)
 
-        for s in range(S):
-            start_pos_pred = np.asarray(cp_np[s, 0, :3], dtype=np.float64)
-            goal_pos_pred  = np.asarray(cp_np[s, -1, :3], dtype=np.float64)
-            start_errs[s] = float(np.linalg.norm(start_pos_pred - start_pos_gt))
-            goal_errs[s]  = float(np.linalg.norm(goal_pos_pred - goal_pos_gt))
-            grasp_errs[s] = fk_min_grasp_err_from_traj9(cp_np[s], q_grasp_np)
+            for s in range(S):
+                start_pos_pred = np.asarray(cp_np[s, 0, :3], dtype=np.float64)
+                goal_pos_pred  = np.asarray(cp_np[s, -1, :3], dtype=np.float64)
+                start_errs[s] = float(np.linalg.norm(start_pos_pred - start_pos_gt))
+                goal_errs[s]  = float(np.linalg.norm(goal_pos_pred - goal_pos_gt))
+                grasp_errs[s] = fk_min_grasp_err_from_traj9(cp_np[s], q_grasp_np)
 
-            sm = compute_smooth_metrics_traj9(cp_np[s])
-            uav_a_mean[s] = sm["uav_a_mean"]
-            uav_j_mean[s] = sm["uav_j_mean"]
-            yaw_a_mean[s] = sm["yaw_a_mean"]
-            arm_a_mean[s] = sm["arm_a_mean"]
-            seg = np.diff(cp_np[s, :, :3], axis=0)
-            path_len[s] = float(np.sum(np.linalg.norm(seg, axis=1)))
-            path_ratio[s] = float(path_len[s] / straight_len)
-            turn_xy[s] = _compute_turn_xy(cp_np[s, :, :3])
-            end_dist = float(np.linalg.norm(cp_np[s, -1, :3] - cp_np[s, 0, :3]))
-            straight_ratio[s] = float(end_dist / max(path_len[s], 1e-6))
-            if args.obst_enable and len(case_spheres) > 0:
-                obst_clr_min[s] = min_clearance_to_spheres_traj9(cp_np[s], case_spheres)
+                sm = compute_smooth_metrics_traj9(cp_np[s])
+                uav_a_mean[s] = sm["uav_a_mean"]
+                uav_j_mean[s] = sm["uav_j_mean"]
+                yaw_a_mean[s] = sm["yaw_a_mean"]
+                arm_a_mean[s] = sm["arm_a_mean"]
+                seg = np.diff(cp_np[s, :, :3], axis=0)
+                path_len[s] = float(np.sum(np.linalg.norm(seg, axis=1)))
+                path_ratio[s] = float(path_len[s] / straight_len)
+                turn_xy[s] = _compute_turn_xy(cp_np[s, :, :3])
+                end_dist = float(np.linalg.norm(cp_np[s, -1, :3] - cp_np[s, 0, :3]))
+                straight_ratio[s] = float(end_dist / max(path_len[s], 1e-6))
+                if args.obst_enable and len(case_spheres) > 0:
+                    obst_clr_min[s] = min_clearance_to_spheres_traj9(cp_np[s], case_spheres)
 
-        # Selection policy:
-        # default: best by grasp error;
-        # if obstacle enabled: safety-pool first, then weighted normalized multi-objective score.
-        def _zscore_with_idx(v: np.ndarray, norm_idx: np.ndarray) -> np.ndarray:
-            vv = np.asarray(v, dtype=np.float64)
-            idx = np.asarray(norm_idx, dtype=np.int64).reshape(-1)
-            if idx.size <= 0:
-                idx = np.arange(vv.shape[0], dtype=np.int64)
-            base = vv[idx]
-            mu = float(np.mean(base))
-            sd = float(np.std(base))
-            if (not np.isfinite(sd)) or sd < 1e-9:
-                return np.zeros_like(vv, dtype=np.float64)
-            return (vv - mu) / sd
+            # Extra geometric stats for selection debug / sanity checks (kappa spikes, d2 spikes, max turn).
+            kappa_max = np.zeros((S,), dtype=np.float64)
+            d2_max = np.zeros((S,), dtype=np.float64)
+            turn_max_deg = np.zeros((S,), dtype=np.float64)
+            if S > 0 and cp_np.shape[1] >= 3:
+                xyz_all = np.asarray(cp_np[:, :, :3], dtype=np.float64)  # (S,H,3)
+                p0 = xyz_all[:, :-2, :]
+                p1 = xyz_all[:, 1:-1, :]
+                p2 = xyz_all[:, 2:, :]
 
-        w_sel_grasp = float(args.obst_select_w_grasp)
-        w_sel_j = float(args.obst_select_w_j)
-        w_sel_a = float(args.obst_select_w_a)
-        w_sel_len = float(args.obst_select_w_len)
-        w_sel_turn = float(args.obst_select_w_turn)
-        w_sel_straight = float(args.obst_select_w_straight)
-        select_norm_idx = np.arange(S, dtype=np.int64)
+                d2 = p2 - 2.0 * p1 + p0
+                d2n = np.linalg.norm(d2, axis=2)
+                if d2n.size:
+                    d2_max = np.max(d2n, axis=1)
 
-        def _build_selection_score(norm_idx: np.ndarray) -> np.ndarray:
-            z_grasp = _zscore_with_idx(grasp_errs, norm_idx)
-            z_j = _zscore_with_idx(uav_j_mean, norm_idx)
-            z_a = _zscore_with_idx(uav_a_mean, norm_idx)
-            z_len = _zscore_with_idx(path_ratio, norm_idx)
-            z_turn = _zscore_with_idx(turn_xy, norm_idx)
-            z_straight = _zscore_with_idx(straight_ratio, norm_idx)
-            return (
-                w_sel_grasp * z_grasp
-                + w_sel_j * z_j
-                + w_sel_a * z_a
-                + w_sel_len * z_len
-                + w_sel_turn * z_turn
-                - w_sel_straight * z_straight
-            )
+                v0 = p1 - p0
+                v1 = p2 - p1
+                a = np.linalg.norm(v0, axis=2)
+                b = np.linalg.norm(v1, axis=2)
+                c = np.linalg.norm(p2 - p0, axis=2)
+                cross = np.cross(v0, v1)
+                area2 = np.linalg.norm(cross, axis=2)
+                denom = a * b * c
+                kappa = np.where(denom > 1e-12, 2.0 * area2 / denom, 0.0)
+                if kappa.size:
+                    kappa_max = np.max(kappa, axis=1)
 
-        if args.obst_enable and len(case_spheres) > 0:
+                dot = np.sum(v0 * v1, axis=2)
+                den2 = a * b
+                cosang = np.where(den2 > 1e-12, dot / den2, 1.0)  # no motion -> angle=0
+                cosang = np.clip(cosang, -1.0, 1.0)
+                ang = np.degrees(np.arccos(cosang))
+                if ang.size:
+                    turn_max_deg = np.max(ang, axis=1)
+            kappa_max = np.where(np.isfinite(kappa_max), kappa_max, 0.0)
+            d2_max = np.where(np.isfinite(d2_max), d2_max, 0.0)
+            turn_max_deg = np.where(np.isfinite(turn_max_deg), turn_max_deg, 0.0)
+
+            # Selection policy:
+            # if influence enabled: safety-pool first, then weighted normalized multi-objective score.
+            # if influence disabled: select by the same score but WITHOUT any obstacle filtering.
+            def _zscore_with_idx(v: np.ndarray, norm_idx: np.ndarray) -> np.ndarray:
+                vv = np.asarray(v, dtype=np.float64)
+                idx2 = np.asarray(norm_idx, dtype=np.int64).reshape(-1)
+                if idx2.size <= 0:
+                    idx2 = np.arange(vv.shape[0], dtype=np.int64)
+                base = vv[idx2]
+                mu = float(np.mean(base))
+                sd = float(np.std(base))
+                if (not np.isfinite(sd)) or sd < 1e-9:
+                    return np.zeros_like(vv, dtype=np.float64)
+                return (vv - mu) / sd
+
+            w_sel_grasp = float(args.obst_select_w_grasp)
+            w_sel_j = float(args.obst_select_w_j)
+            w_sel_a = float(args.obst_select_w_a)
+            w_sel_len = float(args.obst_select_w_len)
+            w_sel_turn = float(args.obst_select_w_turn)
+            w_sel_straight = float(args.obst_select_w_straight)
+
+            def _build_selection_score(norm_idx: np.ndarray) -> np.ndarray:
+                z_grasp = _zscore_with_idx(grasp_errs, norm_idx)
+                z_j = _zscore_with_idx(uav_j_mean, norm_idx)
+                z_a = _zscore_with_idx(uav_a_mean, norm_idx)
+                z_len = _zscore_with_idx(path_ratio, norm_idx)
+                z_turn = _zscore_with_idx(turn_xy, norm_idx)
+                z_straight = _zscore_with_idx(straight_ratio, norm_idx)
+                return (
+                    w_sel_grasp * z_grasp
+                    + w_sel_j * z_j
+                    + w_sel_a * z_a
+                    + w_sel_len * z_len
+                    + w_sel_turn * z_turn
+                    - w_sel_straight * z_straight
+                )
+
             safe_thr = float(args.obst_safe_margin)
             base_thr = max(0.03, float(args.obst_select_min_clearance))
 
-            cand = np.where(obst_clr_min >= safe_thr)[0]
-            if cand.size > 0:
-                print(f"[SELECT_SAFE] case={idx:04d} using safe pool {cand.size}/{S} (safe_thr={safe_thr:.3f})")
-            else:
-                cand = np.where(obst_clr_min >= base_thr)[0]
-                if cand.size > 0:
-                    print(f"[SELECT_BASE] case={idx:04d} no safe pool; using clr>={base_thr:.3f} pool {cand.size}/{S}")
+            select_norm_idx = np.arange(S, dtype=np.int64)
+            score = _build_selection_score(select_norm_idx)
+            cand_pool = np.arange(S, dtype=np.int64)
+            non_coll = np.zeros((0,), dtype=np.int64)
+            all_colliding = False
 
-            if cand.size == 0:
-                best_idx = int(np.argmax(obst_clr_min))
-                print(
-                    f"[SELECT_NO_FEAS] case={idx:04d} no sample with clr>={base_thr:.3f}; "
-                    f"fallback to max-clearance sample clr={float(obst_clr_min[best_idx]):.4f}"
-                )
-            else:
-                select_norm_idx = cand if cand.size >= 2 else np.arange(S, dtype=np.int64)
-                score = _build_selection_score(select_norm_idx)
-                best_idx = int(cand[int(np.argmin(score[cand]))])
-                print(
-                    f"[SELECT_SCORE] case={idx:04d} sid={best_idx:03d} "
-                    f"clr={float(obst_clr_min[best_idx]):.4f} "
-                    f"path_ratio={float(path_ratio[best_idx]):.3f} "
-                    f"turn_xy={float(turn_xy[best_idx]):.4f} "
-                    f"straight_ratio={float(straight_ratio[best_idx]):.3f} "
-                    f"score={float(score[best_idx]):.6f} "
-                    f"(w_grasp={w_sel_grasp:.3f},w_j={w_sel_j:.3f},w_a={w_sel_a:.3f},"
-                    f"w_len={w_sel_len:.3f},w_turn={w_sel_turn:.3f},w_straight={w_sel_straight:.3f})"
-                )
-        else:
-            best_idx = int(np.argmin(grasp_errs))
-        sid_selected = int(best_idx)
-        sid_final = int(sid_selected)
-
-        def _refresh_sid_metrics(sid_upd: int):
-            sid_upd = int(sid_upd)
-            start_pos_pred = np.asarray(cp_np[sid_upd, 0, :3], dtype=np.float64)
-            goal_pos_pred = np.asarray(cp_np[sid_upd, -1, :3], dtype=np.float64)
-            start_errs[sid_upd] = float(np.linalg.norm(start_pos_pred - start_pos_gt))
-            goal_errs[sid_upd] = float(np.linalg.norm(goal_pos_pred - goal_pos_gt))
-            grasp_errs[sid_upd] = fk_min_grasp_err_from_traj9(cp_np[sid_upd], q_grasp_np)
-            sm_sc = compute_smooth_metrics_traj9(cp_np[sid_upd])
-            uav_a_mean[sid_upd] = sm_sc["uav_a_mean"]
-            uav_j_mean[sid_upd] = sm_sc["uav_j_mean"]
-            yaw_a_mean[sid_upd] = sm_sc["yaw_a_mean"]
-            arm_a_mean[sid_upd] = sm_sc["arm_a_mean"]
-            seg_sc = np.diff(cp_np[sid_upd, :, :3], axis=0)
-            path_len[sid_upd] = float(np.sum(np.linalg.norm(seg_sc, axis=1)))
-            path_ratio[sid_upd] = float(path_len[sid_upd] / max(straight_len, 1e-6))
-            turn_xy[sid_upd] = _compute_turn_xy(cp_np[sid_upd, :, :3])
-            end_dist_sc = float(np.linalg.norm(cp_np[sid_upd, -1, :3] - cp_np[sid_upd, 0, :3]))
-            straight_ratio[sid_upd] = float(end_dist_sc / max(path_len[sid_upd], 1e-6))
-            obst_clr_min[sid_upd] = min_clearance_to_spheres_traj9(cp_np[sid_upd], case_spheres)
-
-        # Optional geometric shortcut on selected best trajectory (keep start/mid/goal anchors).
-        if args.obst_enable and bool(args.obst_shortcut_enable) and len(case_spheres) > 0 and (0 <= sid_selected < S):
-            keep_idx = [0, H - 1]
-            tg_keep = int(tag_tg[sid_selected].item()) if torch.is_tensor(tag_tg) else -1
-            if 0 <= tg_keep < H:
-                keep_idx.append(tg_keep)
-            shortcut_margin = float(args.obst_margin) if float(args.obst_proj_margin) < 0.0 else float(args.obst_proj_margin)
-            shortcut_thr = float(max(0.03, float(args.obst_select_min_clearance), float(args.obst_shortcut_safe_thr)))
-            cp_best_sc, accepted_steps, clr_before_sc, clr_after_sc = shortcut_xyz_inplace(
-                traj9=cp_np[sid_selected].copy(),
-                spheres=case_spheres,
-                margin=shortcut_margin,
-                safe_thr=shortcut_thr,
-                n_iter=int(args.obst_shortcut_iter),
-                keep_idx=keep_idx,
-                seed=int(args.seed) * 100000 + idx * 1000 + sid_selected,
-            )
-            if accepted_steps > 0:
-                sid_final = int(sid_selected)
-                cp_np[sid_final] = cp_best_sc
-                _refresh_sid_metrics(sid_final)
-                print(
-                    f"[SHORTCUT] case={idx:04d} sid={sid_final:03d} accepted_steps={accepted_steps} "
-                    f"clr_before={clr_before_sc:.4f} clr_after={clr_after_sc:.4f} "
-                    f"safe_thr={shortcut_thr:.3f}"
-                )
-            else:
-                print(
-                    f"[SHORTCUT] case={idx:04d} sid={sid_selected:03d} accepted_steps=0 "
-                    f"clr_before={clr_before_sc:.4f} safe_thr={shortcut_thr:.3f}"
-                )
-
-        # Always apply one post-projection pass on final selected sid (with or without shortcut).
-        if args.obst_enable and len(case_spheres) > 0 and (0 <= sid_final < S):
-            turn_before_best = float(turn_xy[sid_final])
-            clr_before_best = float(obst_clr_min[sid_final])
-            post_proj_cfg = make_shortcut_post_proj_cfg(
-                obstacle_cfg_case["project"] if (obstacle_cfg_case is not None and isinstance(obstacle_cfg_case.get("project", None), dict)) else None
-            )
-            if bool(post_proj_cfg.get("enable", True)):
-                cp_before_best = cp_np[sid_final].copy()
-                metrics_before_best = dict(
-                    start=float(start_errs[sid_final]),
-                    goal=float(goal_errs[sid_final]),
-                    grasp=float(grasp_errs[sid_final]),
-                    uav_a=float(uav_a_mean[sid_final]),
-                    uav_j=float(uav_j_mean[sid_final]),
-                    yaw_a=float(yaw_a_mean[sid_final]),
-                    arm_a=float(arm_a_mean[sid_final]),
-                    path_len=float(path_len[sid_final]),
-                    path_ratio=float(path_ratio[sid_final]),
-                    turn=float(turn_xy[sid_final]),
-                    straight_ratio=float(straight_ratio[sid_final]),
-                    clr=float(obst_clr_min[sid_final]),
-                )
-                tg_keep_best = int(tag_tg[sid_final].item()) if torch.is_tensor(tag_tg) else -1
-                cp_sid_t = torch.as_tensor(
-                    cp_np[sid_final:sid_final + 1], dtype=cp.dtype, device=cp.device
-                )
-                hard_mask_sid = torch.zeros((1, H), dtype=torch.bool, device=cp.device)
-                hard_mask_sid[:, 0] = True
-                hard_mask_sid[:, H - 1] = True
-                if 0 <= tg_keep_best < H:
-                    hard_mask_sid[:, tg_keep_best] = True
-
-                post_cfg = dict(post_proj_cfg)
-                post_cfg["_proj_cfg_printed"] = False
-                post_cfg["q_start_xyz"] = np.asarray(q_start_np[:3], dtype=np.float32).reshape(1, 3)
-                post_cfg["q_goal_xyz"] = np.asarray(q_goal_np[:3], dtype=np.float32).reshape(1, 3)
-                if (args.mode == "endpoints_and_mid_hard") and (0 <= tg_keep_best < H):
-                    if "q_g_np" in locals():
-                        post_cfg["q_grasp_xyz"] = np.asarray(q_g_np[:3], dtype=np.float32).reshape(1, 3)
+            if args.obst_enable and len(case_spheres) > 0:
+                if obst_influence_enable:
+                    # Hard filter: NEVER select a colliding sample when any collision-free sample exists.
+                    non_coll = np.where(obst_clr_min >= 0.0)[0]
+                    if non_coll.size == 0:
+                        all_colliding = True
+                        cand_pool = np.arange(S, dtype=np.int64)
+                        best_idx = int(np.argmax(obst_clr_min))
+                        print(
+                            f"[SELECT_NO_COLL_FREE] case={idx:04d} pass={label} all samples colliding; "
+                            f"fallback to max-clearance sample sid={best_idx:03d} clr={float(obst_clr_min[best_idx]):.4f}"
+                        )
                     else:
-                        q_grasp_arr = np.asarray(q_grasp_np, dtype=np.float32).reshape(-1)
-                        if q_grasp_arr.shape[0] >= 3:
-                            post_cfg["q_grasp_xyz"] = q_grasp_arr[:3].reshape(1, 3)
-                    post_cfg["t_mid_idx"] = np.asarray([tg_keep_best], dtype=np.int64)
+                        cand = non_coll[np.where(obst_clr_min[non_coll] >= safe_thr)[0]]
+                        if cand.size > 0:
+                            print(
+                                f"[SELECT_SAFE] case={idx:04d} pass={label} using safe pool {cand.size}/{S} "
+                                f"(safe_thr={safe_thr:.3f}, non_coll={non_coll.size}/{S})"
+                            )
+                        else:
+                            cand = non_coll[np.where(obst_clr_min[non_coll] >= base_thr)[0]]
+                            if cand.size > 0:
+                                print(
+                                    f"[SELECT_BASE] case={idx:04d} pass={label} no safe pool; using clr>={base_thr:.3f} pool {cand.size}/{S} "
+                                    f"(non_coll={non_coll.size}/{S})"
+                                )
+                            else:
+                                cand = non_coll
+                                print(
+                                    f"[SELECT_FEASIBLE_ONLY] case={idx:04d} pass={label} no sample with clr>={base_thr:.3f}; "
+                                    f"using collision-free pool {cand.size}/{S}"
+                                )
+                        cand_pool = np.asarray(cand, dtype=np.int64).reshape(-1)
 
-                def _best_post_verbose(msg):
-                    s = str(msg)
-                    if s.startswith("[OBST_PROJ_CFG]"):
-                        print(s.replace("[OBST_PROJ_CFG]", "[BEST_POST_CFG]"))
-                    elif s.startswith("[OBST_PROJ_ADAPT]"):
-                        print(s.replace("[OBST_PROJ_ADAPT]", "[BEST_POST_ADAPT]"))
-                    else:
-                        print(s)
+                        # Normalize the multi-objective score on the feasible pool when possible.
+                        select_norm_idx = cand if cand.size >= 2 else np.arange(S, dtype=np.int64)
+                        score = _build_selection_score(select_norm_idx)
+                        best_idx = int(cand[int(np.argmin(score[cand]))])
+                        print(
+                            f"[SELECT_SCORE] case={idx:04d} pass={label} sid={best_idx:03d} "
+                            f"clr={float(obst_clr_min[best_idx]):.4f} "
+                            f"path_ratio={float(path_ratio[best_idx]):.3f} "
+                            f"turn_xy={float(turn_xy[best_idx]):.4f} "
+                            f"straight_ratio={float(straight_ratio[best_idx]):.3f} "
+                            f"score={float(score[best_idx]):.6f} "
+                            f"(w_grasp={w_sel_grasp:.3f},w_j={w_sel_j:.3f},w_a={w_sel_a:.3f},"
+                            f"w_len={w_sel_len:.3f},w_turn={w_sel_turn:.3f},w_straight={w_sel_straight:.3f})"
+                        )
+                else:
+                    best_idx = int(np.argmin(score))
+                    cand_pool = np.arange(S, dtype=np.int64)
+                    print(
+                        f"[SELECT_SCORE_NO_OBST] case={idx:04d} pass={label} sid={best_idx:03d} "
+                        f"clr={float(obst_clr_min[best_idx]):.4f} "
+                        f"path_ratio={float(path_ratio[best_idx]):.3f} "
+                        f"turn_xy={float(turn_xy[best_idx]):.4f} "
+                        f"straight_ratio={float(straight_ratio[best_idx]):.3f} "
+                        f"score={float(score[best_idx]):.6f}"
+                    )
+            else:
+                best_idx = int(np.argmin(grasp_errs))
+                cand_pool = np.arange(S, dtype=np.int64)
 
-                cp_sid_t, _ = apply_obstacle_projection_with_adaptive(
-                    traj=cp_sid_t,
-                    hard_mask=hard_mask_sid,
+            topk = int(max(0, int(getattr(args, "obst_select_debug_topk", 0))))
+            if topk > 0 and S > 0:
+                pool = np.asarray(cand_pool, dtype=np.int64).reshape(-1)
+                if pool.size <= 0:
+                    pool = np.arange(S, dtype=np.int64)
+                if all_colliding:
+                    order = pool[np.argsort(-np.asarray(obst_clr_min[pool], dtype=np.float64))]
+                else:
+                    order = pool[np.argsort(np.asarray(score[pool], dtype=np.float64))]
+                show = order[: min(topk, int(order.size))]
+                print(
+                    f"[SELECT_TOPK] case={idx:04d} pass={label} pool={int(pool.size)}/{int(S)} "
+                    f"topk={int(show.size)} best={int(best_idx):03d} all_colliding={int(all_colliding)}"
+                )
+                for rr, sid2 in enumerate(show.tolist()):
+                    sid2 = int(sid2)
+                    mark = "<BEST>" if sid2 == int(best_idx) else ""
+                    print(
+                        f"[SELECT_TOPK_ROW] rank={rr + 1} sid={sid2:03d} "
+                        f"score={float(score[sid2]):.6f} clr={float(obst_clr_min[sid2]):.4f} "
+                        f"path_len={float(path_len[sid2]):.4f} "
+                        f"kappa_max={float(kappa_max[sid2]):.3f} d2_max={float(d2_max[sid2]):.5f} "
+                        f"turn_max_deg={float(turn_max_deg[sid2]):.2f} {mark}"
+                    )
+
+            sid_selected = int(best_idx)
+            sid_final = int(sid_selected)
+
+            def _refresh_sid_metrics(sid_upd: int):
+                sid_upd = int(sid_upd)
+                start_pos_pred = np.asarray(cp_np[sid_upd, 0, :3], dtype=np.float64)
+                goal_pos_pred = np.asarray(cp_np[sid_upd, -1, :3], dtype=np.float64)
+                start_errs[sid_upd] = float(np.linalg.norm(start_pos_pred - start_pos_gt))
+                goal_errs[sid_upd] = float(np.linalg.norm(goal_pos_pred - goal_pos_gt))
+                grasp_errs[sid_upd] = fk_min_grasp_err_from_traj9(cp_np[sid_upd], q_grasp_np)
+                sm_sc = compute_smooth_metrics_traj9(cp_np[sid_upd])
+                uav_a_mean[sid_upd] = sm_sc["uav_a_mean"]
+                uav_j_mean[sid_upd] = sm_sc["uav_j_mean"]
+                yaw_a_mean[sid_upd] = sm_sc["yaw_a_mean"]
+                arm_a_mean[sid_upd] = sm_sc["arm_a_mean"]
+                seg_sc = np.diff(cp_np[sid_upd, :, :3], axis=0)
+                path_len[sid_upd] = float(np.sum(np.linalg.norm(seg_sc, axis=1)))
+                path_ratio[sid_upd] = float(path_len[sid_upd] / max(straight_len, 1e-6))
+                turn_xy[sid_upd] = _compute_turn_xy(cp_np[sid_upd, :, :3])
+                end_dist_sc = float(np.linalg.norm(cp_np[sid_upd, -1, :3] - cp_np[sid_upd, 0, :3]))
+                straight_ratio[sid_upd] = float(end_dist_sc / max(path_len[sid_upd], 1e-6))
+                if args.obst_enable and len(case_spheres) > 0:
+                    obst_clr_min[sid_upd] = min_clearance_to_spheres_traj9(cp_np[sid_upd], case_spheres)
+
+            # Optional geometric shortcut only when obstacle influence is enabled.
+            if args.obst_enable and obst_influence_enable and bool(args.obst_shortcut_enable) and len(case_spheres) > 0 and (0 <= sid_selected < S):
+                keep_idx = [0, H - 1]
+                tg_keep = int(tag_tg[sid_selected].item()) if torch.is_tensor(tag_tg) else -1
+                if 0 <= tg_keep < H:
+                    keep_idx.append(tg_keep)
+                shortcut_margin = float(args.obst_margin) if float(args.obst_proj_margin) < 0.0 else float(args.obst_proj_margin)
+                shortcut_thr = float(max(0.03, float(args.obst_select_min_clearance), float(args.obst_shortcut_safe_thr)))
+                cp_best_sc, accepted_steps, clr_before_sc, clr_after_sc = shortcut_xyz_inplace(
+                    traj9=cp_np[sid_selected].copy(),
                     spheres=case_spheres,
-                    proj_cfg=post_cfg,
-                    verbose_fn=_best_post_verbose,
+                    margin=shortcut_margin,
+                    safe_thr=shortcut_thr,
+                    n_iter=int(args.obst_shortcut_iter),
+                    keep_idx=keep_idx,
+                    seed=int(args.seed) * 100000 + idx * 1000 + sid_selected,
                 )
-                score_before_all = _build_selection_score(select_norm_idx)
-                score_before_best = float(score_before_all[sid_final])
-                cp_np[sid_final] = cp_sid_t[0].detach().cpu().numpy()
-                _refresh_sid_metrics(sid_final)
-                turn_after_best = float(turn_xy[sid_final])
-                clr_after_best = float(obst_clr_min[sid_final])
-                score_after_all = _build_selection_score(select_norm_idx)
-                score_after_best = float(score_after_all[sid_final])
-                drop_max = 0.03
-                turn_eps = 0.5
-                score_eps = 1e-3
-                safe_floor = float(max(float(args.obst_select_min_clearance), float(safe_thr)))
-                hard_ok = bool(clr_after_best >= safe_floor)
-                drop_ok = bool(clr_after_best >= (clr_before_best - drop_max))
-                benefit_ok = bool(
-                    (turn_after_best < (turn_before_best - turn_eps))
-                    or (score_after_best < (score_before_best - score_eps))
+                if accepted_steps > 0:
+                    sid_final = int(sid_selected)
+                    cp_np[sid_final] = cp_best_sc
+                    _refresh_sid_metrics(sid_final)
+                    print(
+                        f"[SHORTCUT] case={idx:04d} pass={label} sid={sid_final:03d} accepted_steps={accepted_steps} "
+                        f"clr_before={clr_before_sc:.4f} clr_after={clr_after_sc:.4f} "
+                        f"safe_thr={shortcut_thr:.3f}"
+                    )
+                else:
+                    print(
+                        f"[SHORTCUT] case={idx:04d} pass={label} sid={sid_selected:03d} accepted_steps=0 "
+                        f"clr_before={clr_before_sc:.4f} safe_thr={shortcut_thr:.3f}"
+                    )
+
+            # Always apply one post-projection pass ONLY when obstacle influence is enabled.
+            post_proj_ran = 0
+            post_proj_applied = 0
+            post_proj_rollback = 0
+            traj_before_post = None
+            traj_after_post = None  # attempt (before rollback), for hard verification
+            best_post_delta_max = 0.0
+            best_post_kappa_max_before = 0.0
+            best_post_kappa_max_after = 0.0
+            best_post_d2_max_before = 0.0
+            best_post_d2_max_after = 0.0
+            best_post_turn_max_deg_before = 0.0
+            best_post_turn_max_deg_after = 0.0
+            if args.obst_enable and obst_influence_enable and len(case_spheres) > 0 and (0 <= sid_final < S):
+                turn_before_best = float(turn_xy[sid_final])
+                clr_before_best = float(obst_clr_min[sid_final])
+                post_proj_cfg = make_shortcut_post_proj_cfg(
+                    obstacle_cfg_case["project"] if (obstacle_cfg_case is not None and isinstance(obstacle_cfg_case.get("project", None), dict)) else None
                 )
-                rollback_best_post = not (hard_ok and drop_ok and benefit_ok)
-                if rollback_best_post:
-                    cp_np[sid_final] = cp_before_best
-                    start_errs[sid_final] = metrics_before_best["start"]
-                    goal_errs[sid_final] = metrics_before_best["goal"]
-                    grasp_errs[sid_final] = metrics_before_best["grasp"]
-                    uav_a_mean[sid_final] = metrics_before_best["uav_a"]
-                    uav_j_mean[sid_final] = metrics_before_best["uav_j"]
-                    yaw_a_mean[sid_final] = metrics_before_best["yaw_a"]
-                    arm_a_mean[sid_final] = metrics_before_best["arm_a"]
-                    path_len[sid_final] = metrics_before_best["path_len"]
-                    path_ratio[sid_final] = metrics_before_best["path_ratio"]
-                    turn_xy[sid_final] = metrics_before_best["turn"]
-                    straight_ratio[sid_final] = metrics_before_best["straight_ratio"]
-                    obst_clr_min[sid_final] = metrics_before_best["clr"]
+                if bool(post_proj_cfg.get("enable", True)):
+                    post_proj_ran = 1
+                    cp_before_best = cp_np[sid_final].copy()
+                    metrics_before_best = dict(
+                        start=float(start_errs[sid_final]),
+                        goal=float(goal_errs[sid_final]),
+                        grasp=float(grasp_errs[sid_final]),
+                        uav_a=float(uav_a_mean[sid_final]),
+                        uav_j=float(uav_j_mean[sid_final]),
+                        yaw_a=float(yaw_a_mean[sid_final]),
+                        arm_a=float(arm_a_mean[sid_final]),
+                        path_len=float(path_len[sid_final]),
+                        path_ratio=float(path_ratio[sid_final]),
+                        turn=float(turn_xy[sid_final]),
+                        straight_ratio=float(straight_ratio[sid_final]),
+                        clr=float(obst_clr_min[sid_final]),
+                    )
+                    tg_keep_best = int(tag_tg[sid_final].item()) if torch.is_tensor(tag_tg) else -1
+                    cp_sid_t = torch.as_tensor(
+                        cp_np[sid_final:sid_final + 1], dtype=cp.dtype, device=cp.device
+                    )
+                    hard_mask_sid = torch.zeros((1, H), dtype=torch.bool, device=cp.device)
+                    hard_mask_sid[:, 0] = True
+                    hard_mask_sid[:, H - 1] = True
+                    if 0 <= tg_keep_best < H:
+                        hard_mask_sid[:, tg_keep_best] = True
+
+                    post_cfg = dict(post_proj_cfg)
+                    post_cfg["_proj_cfg_printed"] = False
+                    post_cfg["debug_terms"] = True
+                    post_cfg["q_start_xyz"] = np.asarray(q_start_np[:3], dtype=np.float32).reshape(1, 3)
+                    post_cfg["q_goal_xyz"] = np.asarray(q_goal_np[:3], dtype=np.float32).reshape(1, 3)
+                    if (args.mode == "endpoints_and_mid_hard") and (0 <= tg_keep_best < H):
+                        if "q_g_np" in locals():
+                            post_cfg["q_grasp_xyz"] = np.asarray(q_g_np[:3], dtype=np.float32).reshape(1, 3)
+                        else:
+                            q_grasp_arr = np.asarray(q_grasp_np, dtype=np.float32).reshape(-1)
+                            if q_grasp_arr.shape[0] >= 3:
+                                post_cfg["q_grasp_xyz"] = q_grasp_arr[:3].reshape(1, 3)
+                        post_cfg["t_mid_idx"] = np.asarray([tg_keep_best], dtype=np.int64)
+
+                    def _best_post_verbose(msg):
+                        s = str(msg)
+                        if s.startswith("[OBST_PROJ_CFG]"):
+                            print(s.replace("[OBST_PROJ_CFG]", "[BEST_POST_CFG]"))
+                        elif s.startswith("[OBST_PROJ_ADAPT]"):
+                            print(s.replace("[OBST_PROJ_ADAPT]", "[BEST_POST_ADAPT]"))
+                        else:
+                            print(s)
+
+                    cp_sid_t, _ = apply_obstacle_projection_with_adaptive(
+                        traj=cp_sid_t,
+                        hard_mask=hard_mask_sid,
+                        spheres=case_spheres,
+                        proj_cfg=post_cfg,
+                        verbose_fn=_best_post_verbose,
+                    )
+                    score_before_all = _build_selection_score(select_norm_idx)
+                    score_before_best = float(score_before_all[sid_final])
+                    cp_np[sid_final] = cp_sid_t[0].detach().cpu().numpy()
+                    _refresh_sid_metrics(sid_final)
+
+                    # Hard verification A: did BEST_POST actually change geometry?
+                    try:
+                        traj_before_post = np.asarray(cp_before_best[:, :3], dtype=np.float64).copy()
+                        traj_after_post = np.asarray(cp_np[sid_final, :, :3], dtype=np.float64).copy()
+                        d = traj_after_post - traj_before_post
+                        dn = np.linalg.norm(d, axis=1) if d.ndim == 2 and d.shape[1] == 3 else np.zeros((0,), dtype=np.float64)
+                        best_post_delta_max = float(np.max(dn)) if dn.size else 0.0
+                        best_post_kappa_max_before = float(np.max(_polyline_curvature_xyz(traj_before_post))) if traj_before_post.shape[0] >= 3 else 0.0
+                        best_post_kappa_max_after = float(np.max(_polyline_curvature_xyz(traj_after_post))) if traj_after_post.shape[0] >= 3 else 0.0
+                        best_post_d2_max_before = float(_polyline_d2_norm_max_xyz(traj_before_post))
+                        best_post_d2_max_after = float(_polyline_d2_norm_max_xyz(traj_after_post))
+                        best_post_turn_max_deg_before = float(_polyline_turn_max_deg_xyz(traj_before_post))
+                        best_post_turn_max_deg_after = float(_polyline_turn_max_deg_xyz(traj_after_post))
+                        print(
+                            f"[BEST_POST_GEOM] case={idx:04d} pass={label} sid={sid_final:03d} "
+                            f"delta_max={best_post_delta_max:.6g} "
+                            f"kappa_max={best_post_kappa_max_before:.4f}->{best_post_kappa_max_after:.4f} "
+                            f"d2_max={best_post_d2_max_before:.6g}->{best_post_d2_max_after:.6g} "
+                            f"turn_max_deg={best_post_turn_max_deg_before:.3f}->{best_post_turn_max_deg_after:.3f}"
+                        )
+                    except Exception as e:
+                        print(f"[BEST_POST_GEOM] failed: {repr(e)}")
+
                     turn_after_best = float(turn_xy[sid_final])
                     clr_after_best = float(obst_clr_min[sid_final])
-                    score_after_best = score_before_best
-                print(
-                    f"[BEST_POST] case={idx:04d} sid={sid_final:03d} "
-                    f"turn_before={turn_before_best:.4f} turn_after={turn_after_best:.4f} "
-                    f"clr_before={clr_before_best:.4f} clr_after={clr_after_best:.4f} "
-                    f"score_before={score_before_best:.6f} score_after={score_after_best:.6f} "
-                    f"hard_ok={int(hard_ok)} drop_ok={int(drop_ok)} benefit_ok={int(benefit_ok)} "
-                    f"rollback={int(rollback_best_post)}"
-                )
-        # IMPORTANT: persist both selection-based and grasp-based indices.
-        # Keep previous best_idx before overriding so we can trace source index.
-        old_best_idx = int(best_idx) if "best_idx" in locals() else -1
-        best_idx_selection = int(sid_final)
-        best_idx_grasp = int(old_best_idx)
-        # `best_idx` is intentionally aligned with selection so `--sample -1` is deterministic.
-        best_idx = int(best_idx_selection)
-        e_start_best = float(start_errs[best_idx])
-        e_goal_best  = float(goal_errs[best_idx])
-        e_grasp_best = float(grasp_errs[best_idx])
+                    score_after_all = _build_selection_score(select_norm_idx)
+                    score_after_best = float(score_after_all[sid_final])
+                    drop_max = 0.03
+                    turn_eps = 0.5
+                    score_eps = 1e-3
+                    safe_floor = float(max(float(args.obst_select_min_clearance), float(safe_thr)))
+                    hard_ok = bool(clr_after_best >= safe_floor)
+                    drop_ok = bool(clr_after_best >= (clr_before_best - drop_max))
+                    benefit_ok = bool(
+                        (turn_after_best < (turn_before_best - turn_eps))
+                        or (score_after_best < (score_before_best - score_eps))
+                    )
+                    rollback_best_post = not (hard_ok and drop_ok and benefit_ok)
+                    post_proj_rollback = int(bool(rollback_best_post))
+                    post_proj_applied = int(bool(not rollback_best_post))
+                    if rollback_best_post:
+                        cp_np[sid_final] = cp_before_best
+                        start_errs[sid_final] = metrics_before_best["start"]
+                        goal_errs[sid_final] = metrics_before_best["goal"]
+                        grasp_errs[sid_final] = metrics_before_best["grasp"]
+                        uav_a_mean[sid_final] = metrics_before_best["uav_a"]
+                        uav_j_mean[sid_final] = metrics_before_best["uav_j"]
+                        yaw_a_mean[sid_final] = metrics_before_best["yaw_a"]
+                        arm_a_mean[sid_final] = metrics_before_best["arm_a"]
+                        path_len[sid_final] = metrics_before_best["path_len"]
+                        path_ratio[sid_final] = metrics_before_best["path_ratio"]
+                        turn_xy[sid_final] = metrics_before_best["turn"]
+                        straight_ratio[sid_final] = metrics_before_best["straight_ratio"]
+                        obst_clr_min[sid_final] = metrics_before_best["clr"]
+                        turn_after_best = float(turn_xy[sid_final])
+                        clr_after_best = float(obst_clr_min[sid_final])
+                        score_after_best = score_before_best
+                    print(
+                        f"[BEST_POST] case={idx:04d} pass={label} sid={sid_final:03d} "
+                        f"turn_before={turn_before_best:.4f} turn_after={turn_after_best:.4f} "
+                        f"clr_before={clr_before_best:.4f} clr_after={clr_after_best:.4f} "
+                        f"score_before={score_before_best:.6f} score_after={score_after_best:.6f} "
+                        f"hard_ok={int(hard_ok)} drop_ok={int(drop_ok)} benefit_ok={int(benefit_ok)} "
+                        f"rollback={int(rollback_best_post)}"
+                    )
 
-        uav_a_best = float(uav_a_mean[best_idx])
-        uav_j_best = float(uav_j_mean[best_idx])
-        yaw_a_best = float(yaw_a_mean[best_idx])
-        arm_a_best = float(arm_a_mean[best_idx])
-        obst_clr_best = float(obst_clr_min[best_idx]) if (args.obst_enable and len(case_spheres) > 0) else float("inf")
+            # IMPORTANT: persist both selection-based and grasp-based indices.
+            old_best_idx = int(best_idx)
+            best_idx_selection = int(sid_final)
+            best_idx_grasp = int(old_best_idx)
+            best_idx = int(best_idx_selection)
 
-        all3 = (start_errs < args.succ_thresh_m) & (goal_errs < args.succ_thresh_m) & (grasp_errs < args.succ_thresh_m)
-        succ_all3 = float(all3.mean())
+            e_start_best = float(start_errs[best_idx])
+            e_goal_best  = float(goal_errs[best_idx])
+            e_grasp_best = float(grasp_errs[best_idx])
 
-        if args.dbg_smooth and idx == 0:
-            show_ids = [0, min(1, S - 1), best_idx]
-            show_ids = list(dict.fromkeys(show_ids))
-            for sid in show_ids:
-                sm = compute_smooth_metrics_traj9(cp_np[sid])
-                print(f"[DBG_SMOOTH] sample{sid:02d} "
-                      f"uav_a_mean={sm['uav_a_mean']:.6f} uav_j_mean={sm['uav_j_mean']:.6f} "
-                      f"yaw_a_mean={sm['yaw_a_mean']:.6f} arm_a_mean={sm['arm_a_mean']:.6f}")
+            uav_a_best = float(uav_a_mean[best_idx])
+            uav_j_best = float(uav_j_mean[best_idx])
+            yaw_a_best = float(yaw_a_mean[best_idx])
+            arm_a_best = float(arm_a_mean[best_idx])
+            obst_clr_best = float(obst_clr_min[best_idx]) if (args.obst_enable and len(case_spheres) > 0) else float("inf")
 
-        msg = (
-            f"[CASE {idx:04d}] "
-            f"e_start_uav={e_start_best:.4f} m | "
-            f"e_goal_uav={e_goal_best:.4f} m | "
-            f"e_grasp_ee_min={e_grasp_best:.4f} m | "
-            f"smooth(uav_a={uav_a_best:.6f}, uav_j={uav_j_best:.6f}, yaw_a={yaw_a_best:.6f}, arm_a={arm_a_best:.6f})"
-        )
+            all3 = (start_errs < args.succ_thresh_m) & (goal_errs < args.succ_thresh_m) & (grasp_errs < args.succ_thresh_m)
+            succ_all3 = float(all3.mean())
+
+            has_collision = bool(obst_clr_best < 0.0) if (args.obst_enable and len(case_spheres) > 0) else False
+            has_unsafe = bool(obst_clr_best < float(args.obst_safe_margin)) if (args.obst_enable and len(case_spheres) > 0) else False
+
+            msg = (
+                f"[CASE {idx:04d}|{label}] "
+                f"e_start_uav={e_start_best:.4f} m | "
+                f"e_goal_uav={e_goal_best:.4f} m | "
+                f"e_grasp_ee_min={e_grasp_best:.4f} m | "
+                f"smooth(uav_a={uav_a_best:.6f}, uav_j={uav_j_best:.6f}, yaw_a={yaw_a_best:.6f}, arm_a={arm_a_best:.6f})"
+            )
+            if args.obst_enable and len(case_spheres) > 0:
+                msg += f" | obst_clr_min={obst_clr_best:.4f} m (unsafe={int(has_unsafe)} coll={int(has_collision)})"
+            msg += f" | path_len={float(path_len[best_idx]):.4f} m (ratio={float(path_ratio[best_idx]):.3f})"
+            msg += f" | turn_xy={float(turn_xy[best_idx]):.4f} | straight_ratio={float(straight_ratio[best_idx]):.3f}"
+            msg += f" | succ@2cm(all3)={succ_all3:.3f}"
+            print(msg)
+
+            out_npz = os.path.join(args.save_dir, f"case_{idx:04d}_samples{out_suffix}.npz")
+            if args.obst_enable:
+                obst_spheres_all_np = np.array(
+                    [[float(c[0]), float(c[1]), float(c[2]), float(r)] for c, r in case_spheres],
+                    dtype=np.float32,
+                ).reshape(-1, 4)
+                obst_sphere_from_box_np = np.array(case_sphere_from_box, dtype=np.int64).reshape(-1)
+                if obst_sphere_from_box_np.shape[0] != obst_spheres_all_np.shape[0]:
+                    obst_sphere_from_box_np = np.zeros((obst_spheres_all_np.shape[0],), dtype=np.int64)
+                obst_spheres_raw_np = obst_spheres_all_np[obst_sphere_from_box_np == 0].reshape(-1, 4)
+                obst_spheres_proxy_np = obst_spheres_all_np[obst_sphere_from_box_np != 0].reshape(-1, 4)
+                obst_boxes_np = np.array(
+                    [[float(c[0]), float(c[1]), float(c[2]), float(h[0]), float(h[1]), float(h[2])] for c, h in case_boxes],
+                    dtype=np.float32,
+                ).reshape(-1, 6)
+            else:
+                obst_spheres_all_np = np.zeros((0, 4), dtype=np.float32)
+                obst_spheres_raw_np = np.zeros((0, 4), dtype=np.float32)
+                obst_spheres_proxy_np = np.zeros((0, 4), dtype=np.float32)
+                obst_sphere_from_box_np = np.zeros((0,), dtype=np.int64)
+                obst_boxes_np = np.zeros((0, 6), dtype=np.float32)
+
+            obst_hash = _obst_hash_sha1(obst_spheres_all_np, obst_boxes_np)
+            print(f"[OBST_HASH] case={idx:04d} pass={label} hash={obst_hash} spheres={int(obst_spheres_all_np.shape[0])} boxes={int(obst_boxes_np.shape[0])}")
+
+            traj_time = None
+            traj_speed = None
+            traj_acc = None
+            traj_exec_time = None
+            traj_exec_xyz = None
+            traj_exec_vel = None
+            traj_exec_len = None
+            if bool(getattr(args, "traj_time_enable", False)):
+                # IMPORTANT: time parameterization must NOT change geometry. Catch any accidental
+                # resample/spline overwrite bugs early.
+                traj_geom_ref = np.asarray(cp_np[:, :, :3], dtype=np.float32).copy()
+                try:
+                    xyz_all = np.asarray(cp_np[:, :, :3], dtype=np.float64)
+                    uav_r = float(getattr(args, "obst_uav_radius", 0.0))
+                    clr_all = _clearance_uav_xyz_to_spheres_batch(xyz_all, case_spheres, uav_radius=uav_r)
+                    grasp_xyz_time = None
+                    try:
+                        qg = np.asarray(q_grasp_np, dtype=np.float64).reshape(-1)
+                        if qg.shape[0] >= 3 and np.all(np.isfinite(qg[:3])):
+                            grasp_xyz_time = qg[:3].copy()
+                    except Exception:
+                        grasp_xyz_time = None
+                    traj_time = np.zeros((S, H), dtype=np.float32)
+                    traj_speed = np.zeros((S, H), dtype=np.float32)
+                    traj_acc = np.zeros((S, H), dtype=np.float32)
+                    exec_enable = bool(getattr(args, "traj_exec_enable", True))
+                    dt_ctrl = float(getattr(args, "traj_exec_dt", 0.02))
+                    exec_time_list = []
+                    exec_xyz_list = []
+                    exec_vel_list = []
+                    exec_len = np.zeros((S,), dtype=np.int64)
+                    exec_max = 0
+                    info_best = None
+                    d_goal_best = None
+                    for s in range(S):
+                        d_goal_s = None
+                        if grasp_xyz_time is not None:
+                            try:
+                                traj9_s = np.asarray(cp_np[int(s), :, :9], dtype=np.float64)
+                                if traj9_s.shape == (H, 9) and np.all(np.isfinite(traj9_s)):
+                                    ee_xyz = np.zeros((H, 3), dtype=np.float64)
+                                    for tt in range(H):
+                                        ee_xyz[tt] = fk_ee_xyz_from_q9(traj9_s[tt])
+                                    d_goal_s = np.linalg.norm(ee_xyz - grasp_xyz_time[None, :], axis=1)
+                            except Exception:
+                                d_goal_s = None
+                        t_arr, v_arr, a_arr, info = _time_parameterize_xyz_by_clearance_and_curvature(
+                            xyz=xyz_all[s],
+                            clr=clr_all[s],
+                            safe_margin=float(args.obst_safe_margin),
+                            d_goal=d_goal_s,
+                            goal_mode=str(getattr(args, "traj_time_goal_mode", "smoothstep")),
+                            goal_sigma=float(getattr(args, "traj_time_goal_sigma", 0.25)),
+                            goal_d_stop=float(getattr(args, "traj_time_goal_d_stop", 0.08)),
+                            goal_d_full=float(getattr(args, "traj_time_goal_d_full", 0.35)),
+                            v_free=float(getattr(args, "traj_time_v_free", -1.0)),
+                            v_max=float(getattr(args, "traj_time_v_max", -1.0)),
+                            v_min_ratio=float(getattr(args, "traj_time_v_min_ratio", 0.05)),
+                            v_min_goal=float(getattr(args, "traj_time_goal_v_min", 0.10)),
+                            goal_r_stop=float(getattr(args, "traj_time_goal_r_stop", 0.20)),
+                            goal_k=float(getattr(args, "traj_time_goal_k", 0.05)),
+                            obs_clr0_factor=float(getattr(args, "traj_time_obs_clr0_factor", 2.0)),
+                            obs_clr_k_factor=float(getattr(args, "traj_time_obs_clr_k_factor", 0.5)),
+                            a_max=float(getattr(args, "traj_time_a_max", -1.0)),
+                            a_lat_max=float(getattr(args, "traj_time_a_lat_max", -1.0)),
+                            kappa_ref_p=float(getattr(args, "traj_time_kappa_ref_p", 95.0)),
+                            dt_min=float(getattr(args, "traj_time_dt_min", 1e-4)),
+                            dt_max=float(getattr(args, "traj_time_dt_max", 10.0)),
+                            cap_smooth_window=int(getattr(args, "traj_time_cap_smooth_window", 1)),
+                            j_max=float(getattr(args, "traj_time_j_max", 0.0)),
+                            j_iters=int(getattr(args, "traj_time_j_iters", 3)),
+                            return_debug_arrays=bool(getattr(args, "traj_time_debug", False) and int(s) == int(best_idx)),
+                        )
+                        traj_time[s] = np.asarray(t_arr, dtype=np.float32).reshape(H)
+                        traj_speed[s] = np.asarray(v_arr, dtype=np.float32).reshape(H)
+                        traj_acc[s] = np.asarray(a_arr, dtype=np.float32).reshape(H)
+                        if exec_enable:
+                            t_exec, xyz_exec, vel_exec = _resample_xyz_uniform_dt(
+                                xyz=xyz_all[s],
+                                t=t_arr,
+                                dt_ctrl=dt_ctrl,
+                            )
+                            exec_time_list.append(np.asarray(t_exec, dtype=np.float64))
+                            exec_xyz_list.append(np.asarray(xyz_exec, dtype=np.float64))
+                            exec_vel_list.append(np.asarray(vel_exec, dtype=np.float64))
+                            exec_len[int(s)] = int(t_exec.shape[0])
+                            exec_max = int(max(exec_max, int(t_exec.shape[0])))
+                        if int(s) == int(best_idx):
+                            info_best = dict(info)
+                            if d_goal_s is not None:
+                                d_goal_best = np.asarray(d_goal_s, dtype=np.float64).reshape(H)
+
+                    if exec_enable and exec_max > 0:
+                        traj_exec_time = np.zeros((S, exec_max), dtype=np.float32)
+                        traj_exec_xyz = np.zeros((S, exec_max, 3), dtype=np.float32)
+                        traj_exec_vel = np.zeros((S, exec_max, 3), dtype=np.float32)
+                        traj_exec_len = np.asarray(exec_len, dtype=np.int64).reshape(S)
+                        for s in range(S):
+                            n = int(exec_len[int(s)])
+                            if n <= 0:
+                                continue
+                            t_exec = exec_time_list[int(s)]
+                            xyz_exec = exec_xyz_list[int(s)]
+                            vel_exec = exec_vel_list[int(s)]
+                            traj_exec_time[int(s), :n] = np.asarray(t_exec, dtype=np.float32).reshape(n)
+                            traj_exec_xyz[int(s), :n, :] = np.asarray(xyz_exec, dtype=np.float32).reshape(n, 3)
+                            traj_exec_vel[int(s), :n, :] = np.asarray(vel_exec, dtype=np.float32).reshape(n, 3)
+                            if n < exec_max:
+                                # Pad by holding last pose and zero velocity, while time keeps increasing.
+                                last_t = float(t_exec[-1])
+                                pad_n = int(exec_max - n)
+                                pad_t = last_t + float(max(dt_ctrl, 1e-6)) * (np.arange(pad_n, dtype=np.float64) + 1.0)
+                                traj_exec_time[int(s), n:] = np.asarray(pad_t, dtype=np.float32).reshape(pad_n)
+                                traj_exec_xyz[int(s), n:, :] = np.asarray(xyz_exec[-1], dtype=np.float32).reshape(1, 3)
+                                traj_exec_vel[int(s), n:, :] = 0.0
+
+                    if bool(getattr(args, "traj_time_debug", False)) and (info_best is not None):
+                        sidb = int(best_idx)
+                        t_best = np.asarray(traj_time[sidb], dtype=np.float64).reshape(H)
+                        v_best = np.asarray(traj_speed[sidb], dtype=np.float64).reshape(H)
+                        tail_n = int(min(10, H))
+                        monotonic = bool(np.all(np.diff(t_best) > 0.0)) if H >= 2 else True
+                        t_end = float(t_best[-1])
+                        v_min = float(np.min(v_best)) if v_best.size else 0.0
+                        v_max = float(np.max(v_best)) if v_best.size else 0.0
+                        v_tail = float(np.mean(v_best[-tail_n:])) if (tail_n > 0 and v_best.size) else 0.0
+                        clr_min_pt = float(np.min(clr_all[sidb])) if clr_all is not None else float("inf")
+                        dg_end = float(d_goal_best[-1]) if d_goal_best is not None else float("nan")
+                        dg_tail = float(np.mean(d_goal_best[-tail_n:])) if (d_goal_best is not None and tail_n > 0) else float("nan")
+                        print(
+                            "[TRAJ_TIME] "
+                            f"case={idx:04d} pass={label} sid={sidb:03d} "
+                            f"monotonic={int(monotonic)} "
+                            f"t_end={t_end:.4f} v(min/max)={v_min:.6f}/{v_max:.6f} v_tail{tail_n}={v_tail:.6f} "
+                            f"clr_min_pt={clr_min_pt:.4f} "
+                            f"d_goal_end={dg_end:.4f} d_goal_tail{tail_n}={dg_tail:.4f} "
+                            f"cfg(v_free={info_best.get('v_free', 0):.6g},v_max={info_best.get('v_max', 0):.6g},"
+                            f"a_max={info_best.get('a_max', 0):.6g},a_lat_max={info_best.get('a_lat_max', 0):.6g},"
+                            f"v_min_goal={info_best.get('v_min_goal', 0):.6g},"
+                            f"goal_mode={info_best.get('goal_mode', '')},goal_sigma={info_best.get('goal_sigma', 0):.3g},"
+                            f"goal_d_stop={info_best.get('goal_d_stop', 0):.6g},goal_d_full={info_best.get('goal_d_full', 0):.6g},"
+                            f"goal_r_stop={info_best.get('goal_r_stop', 0):.6g},goal_k={info_best.get('goal_k', 0):.6g},"
+                            f"obs_clr0={info_best.get('obs_clr0', 0):.6g},obs_k={info_best.get('obs_k', 0):.6g},"
+                            f"dt_min={info_best.get('dt_min', 0):.3g},dt_max={info_best.get('dt_max', 0):.3g},"
+                            f"cap_w={info_best.get('cap_smooth_window', 1)},"
+                            f"j_max={info_best.get('j_max', 0):.3g},j_iters={info_best.get('j_iters', 0)})"
+                        )
+                        if traj_exec_len is not None and traj_exec_time is not None:
+                            n_exec = int(traj_exec_len[sidb])
+                            t_exec_end = float(traj_exec_time[sidb, n_exec - 1]) if n_exec > 0 else float("nan")
+                            print(f"[TRAJ_EXEC] sid={sidb:03d} dt_ctrl={float(dt_ctrl):.4f} n_exec={n_exec} t_end_exec={t_exec_end:.4f}")
+
+                        # Cap decomposition table around grasp event i* (argmin dist_to_grasp).
+                        dbg_v_cap = info_best.get("dbg_v_cap", None)              # cap after optional smoothing
+                        dbg_v_cap_raw = info_best.get("dbg_v_cap_raw", None)      # raw cap before smoothing
+                        dbg_v_goal = info_best.get("dbg_v_cap_goal", None)
+                        dbg_v_obs = info_best.get("dbg_v_cap_clr", None)
+                        dbg_v_curv = info_best.get("dbg_v_cap_curv", None)
+                        dbg_dt = info_best.get("dbg_dt_seg", None)
+
+                        if isinstance(dbg_v_cap, np.ndarray):
+                            i_star = None
+                            if d_goal_best is not None and np.any(np.isfinite(d_goal_best)):
+                                try:
+                                    i_star = int(np.nanargmin(d_goal_best))
+                                    i_star = int(max(0, min(H - 1, i_star)))
+                                except Exception:
+                                    i_star = None
+
+                            if i_star is not None:
+                                t_star = float(t_best[i_star])
+                                dg_star = float(d_goal_best[i_star]) if d_goal_best is not None else float("nan")
+                                v_star = float(v_best[i_star]) if v_best is not None else float("nan")
+                                vgoal_star = float(dbg_v_goal[i_star]) if isinstance(dbg_v_goal, np.ndarray) and i_star < dbg_v_goal.shape[0] else float("nan")
+                                vobs_star = float(dbg_v_obs[i_star]) if isinstance(dbg_v_obs, np.ndarray) and i_star < dbg_v_obs.shape[0] else float("nan")
+                                vcurv_star = float(dbg_v_curv[i_star]) if isinstance(dbg_v_curv, np.ndarray) and i_star < dbg_v_curv.shape[0] else float("nan")
+                                vcap_star = float(dbg_v_cap[i_star]) if i_star < dbg_v_cap.shape[0] else float("nan")
+                                print(
+                                    "[TRAJ_TIME_EVENT] "
+                                    f"i_star={i_star:03d} t_grasp={t_star:.4f} d_goal*={dg_star:.4f} "
+                                    f"v*={v_star:.4f} cap(goal/obs/curv/final)=({vgoal_star:.4f},{vobs_star:.4f},{vcurv_star:.4f},{vcap_star:.4f})"
+                                )
+
+                                i0 = int(max(0, i_star - 10))
+                                i1 = int(min(H - 1, i_star + 10))
+                                idxs_u = list(range(i0, i1 + 1))
+                                print("[TRAJ_TIME_TABLE] i t d_goal clr cap_goal cap_obs cap_curv cap_raw cap_final v_after dom dt")
+                                v_max_cfg = float(info_best.get("v_max", float("inf")))
+                                for ii in idxs_u:
+                                    t_i = float(t_best[ii]) if ii < t_best.shape[0] else float("nan")
+                                    dg_i = float(d_goal_best[ii]) if d_goal_best is not None else float("nan")
+                                    clr_i = float(clr_all[sidb, ii]) if clr_all is not None else float("nan")
+                                    vgoal_i = float(dbg_v_goal[ii]) if isinstance(dbg_v_goal, np.ndarray) and ii < dbg_v_goal.shape[0] else float("nan")
+                                    vobs_i = float(dbg_v_obs[ii]) if isinstance(dbg_v_obs, np.ndarray) and ii < dbg_v_obs.shape[0] else float("nan")
+                                    vcurv_i = float(dbg_v_curv[ii]) if isinstance(dbg_v_curv, np.ndarray) and ii < dbg_v_curv.shape[0] else float("nan")
+                                    vcap_raw_i = float(dbg_v_cap_raw[ii]) if isinstance(dbg_v_cap_raw, np.ndarray) and ii < dbg_v_cap_raw.shape[0] else float("nan")
+                                    vcap_i = float(dbg_v_cap[ii]) if ii < dbg_v_cap.shape[0] else float("nan")
+                                    v_i = float(v_best[ii]) if ii < v_best.shape[0] else float("nan")
+                                    dt_i = float(dbg_dt[ii]) if isinstance(dbg_dt, np.ndarray) and ii < dbg_dt.shape[0] else float("nan")
+
+                                    # Dominant limiter (pre-smooth, before accel pass): argmin of goal/obs/curv/vmax.
+                                    dom = "?"
+                                    vals = [vgoal_i, vobs_i, vcurv_i, v_max_cfg]
+                                    names = ["goal", "obs", "curv", "vmax"]
+                                    try:
+                                        j = int(np.nanargmin(np.asarray(vals, dtype=np.float64)))
+                                        dom = names[j]
+                                    except Exception:
+                                        dom = "?"
+
+                                    print(
+                                        f"[TRAJ_TIME_ROW] i={ii:03d} t={t_i:.4f} d_goal={dg_i:.4f} clr={clr_i:.4f} "
+                                        f"cap_goal={vgoal_i:.4f} cap_obs={vobs_i:.4f} cap_curv={vcurv_i:.4f} "
+                                        f"cap_raw={vcap_raw_i:.4f} cap_final={vcap_i:.4f} v_after={v_i:.4f} dom={dom} dt={dt_i:.4f}"
+                                    )
+                except Exception as e:
+                    print(f"[WARN] traj_time computation failed: {type(e).__name__}: {e}")
+                    traj_time = None
+                    traj_speed = None
+                    traj_acc = None
+                # Geometry invariance assertion (must always hold).
+                if not np.array_equal(np.asarray(cp_np[:, :, :3], dtype=np.float32), traj_geom_ref):
+                    raise RuntimeError("[TIME_PARAM] BUG: geometry changed! Timing must not modify traj geometry.")
+
+            save_d = dict(
+                cp=cp_np,
+                q_start=data_cpu["q_start"].numpy(),
+                q_goal=data_cpu["q_goal"].numpy(),
+                q_grasp=data_cpu["q_grasp"].numpy(),
+                best_idx=np.array([best_idx], dtype=np.int64),
+                best_idx_selection=np.array([best_idx_selection], dtype=np.int64),
+                best_idx_grasp=np.array([best_idx_grasp], dtype=np.int64),
+                selected_sid=np.array([sid_selected], dtype=np.int64),
+                sid_final=np.array([best_idx], dtype=np.int64),
+                start_errs=start_errs.astype(np.float32),
+                goal_errs=goal_errs.astype(np.float32),
+                grasp_errs=grasp_errs.astype(np.float32),
+                succ_all3=np.array([succ_all3], dtype=np.float32),
+                uav_a_mean=uav_a_mean.astype(np.float32),
+                uav_j_mean=uav_j_mean.astype(np.float32),
+                yaw_a_mean=yaw_a_mean.astype(np.float32),
+                arm_a_mean=arm_a_mean.astype(np.float32),
+                path_len=path_len.astype(np.float32),
+                path_ratio=path_ratio.astype(np.float32),
+                turn_xy=turn_xy.astype(np.float32),
+                uav_turn=turn_xy.astype(np.float32),
+                straight_ratio=straight_ratio.astype(np.float32),
+                straight_len=np.array([straight_len], dtype=np.float32),
+                obst_clr_min=obst_clr_min.astype(np.float32),
+                mode=np.array([args.mode]),
+                ctx_mode=np.array([args.ctx_mode]),
+                seed=np.array([args.seed], dtype=np.int64),
+                no_wrap_patch=np.array([int(args.no_wrap_patch)], dtype=np.int64),
+                t_g_tag=tag_tg.numpy(),
+                obst_enable=np.array([int(args.obst_enable)], dtype=np.int64),
+                obst_influence_enable=np.array([int(obst_influence_enable)], dtype=np.int64),
+                post_proj_ran=np.array([int(post_proj_ran)], dtype=np.int64),
+                post_proj_applied=np.array([int(post_proj_applied)], dtype=np.int64),
+                post_proj_rollback=np.array([int(post_proj_rollback)], dtype=np.int64),
+                traj_before_post=np.asarray(
+                    traj_before_post if traj_before_post is not None else np.zeros((0, 3), dtype=np.float32),
+                    dtype=np.float32,
+                ),
+                traj_after_post=np.asarray(
+                    traj_after_post if traj_after_post is not None else np.zeros((0, 3), dtype=np.float32),
+                    dtype=np.float32,
+                ),
+                best_post_delta_max=np.array([float(best_post_delta_max)], dtype=np.float32),
+                best_post_kappa_max_before=np.array([float(best_post_kappa_max_before)], dtype=np.float32),
+                best_post_kappa_max_after=np.array([float(best_post_kappa_max_after)], dtype=np.float32),
+                best_post_d2_max_before=np.array([float(best_post_d2_max_before)], dtype=np.float32),
+                best_post_d2_max_after=np.array([float(best_post_d2_max_after)], dtype=np.float32),
+                best_post_turn_max_deg_before=np.array([float(best_post_turn_max_deg_before)], dtype=np.float32),
+                best_post_turn_max_deg_after=np.array([float(best_post_turn_max_deg_after)], dtype=np.float32),
+                obst_mode=np.array([str(case_obst_meta.get("obst_mode", ""))]),
+                obst_total_n=np.array([int(case_obst_meta.get("obst_total_n", -1))], dtype=np.int64),
+                obst_size_scale=np.array([float(case_obst_meta.get("obst_size_scale", float(getattr(args, "obst_size_scale", 1.0))))], dtype=np.float32),
+                obst_hash=np.array([obst_hash]),
+                obst_alpha=np.array([float(args.obst_alpha)], dtype=np.float32),
+                obst_margin=np.array([float(args.obst_margin)], dtype=np.float32),
+                obst_spheres=obst_spheres_all_np,
+                obst_spheres_raw=obst_spheres_raw_np,
+                obst_spheres_proxy=obst_spheres_proxy_np,
+                obst_sphere_from_box=obst_sphere_from_box_np,
+                obst_boxes=obst_boxes_np,
+                obst_safe_margin=np.array([float(args.obst_safe_margin)], dtype=np.float32),
+                obst_select_min_clearance=np.array([float(args.obst_select_min_clearance)], dtype=np.float32),
+                obst_uav_radius=np.array([float(getattr(args, "obst_uav_radius", 0.0))], dtype=np.float32),
+                obst_project_enable=np.array([int(args.obst_project_enable)], dtype=np.int64),
+                obst_proj_iters=np.array([int(args.obst_proj_iters)], dtype=np.int64),
+                obst_proj_lr=np.array([float(args.obst_proj_lr)], dtype=np.float32),
+                obst_proj_w_data=np.array([float(args.obst_proj_w_data)], dtype=np.float32),
+                obst_proj_w_a=np.array([float(args.obst_proj_w_a)], dtype=np.float32),
+                obst_proj_w_j=np.array([float(args.obst_proj_w_j)], dtype=np.float32),
+                obst_proj_w_obst=np.array([float(args.obst_proj_w_obst)], dtype=np.float32),
+                obst_anchor_feasible=np.array([int(anchor_feasible)], dtype=np.int64),
+                obst_anchor_clr_min=np.array([float(anchor_clr_min)], dtype=np.float32),
+            )
+            if traj_time is not None:
+                save_d["traj_time"] = np.asarray(traj_time, dtype=np.float32)
+                save_d["traj_speed"] = np.asarray(traj_speed, dtype=np.float32)
+                save_d["traj_acc"] = np.asarray(traj_acc, dtype=np.float32)
+                save_d["traj_time_enable"] = np.array([1], dtype=np.int64)
+                save_d["traj_time_v_free"] = np.array([float(getattr(args, "traj_time_v_free", -1.0))], dtype=np.float32)
+                save_d["traj_time_v_max"] = np.array([float(getattr(args, "traj_time_v_max", -1.0))], dtype=np.float32)
+                save_d["traj_time_v_min_ratio"] = np.array([float(getattr(args, "traj_time_v_min_ratio", 0.05))], dtype=np.float32)
+                save_d["traj_time_a_max"] = np.array([float(getattr(args, "traj_time_a_max", -1.0))], dtype=np.float32)
+                save_d["traj_time_a_lat_max"] = np.array([float(getattr(args, "traj_time_a_lat_max", -1.0))], dtype=np.float32)
+                v_goal_min = float(getattr(args, "traj_time_goal_v_min", 0.10))
+                save_d["traj_time_goal_mode"] = np.array([str(getattr(args, "traj_time_goal_mode", "smoothstep"))])
+                save_d["traj_time_goal_sigma"] = np.array([float(getattr(args, "traj_time_goal_sigma", 0.25))], dtype=np.float32)
+                save_d["traj_time_goal_d_stop"] = np.array([float(getattr(args, "traj_time_goal_d_stop", 0.08))], dtype=np.float32)
+                save_d["traj_time_goal_d_full"] = np.array([float(getattr(args, "traj_time_goal_d_full", 0.35))], dtype=np.float32)
+                save_d["traj_time_goal_v_min"] = np.array([v_goal_min], dtype=np.float32)
+                # Legacy key retained for backward compatibility (same value).
+                save_d["traj_time_v_min_goal"] = np.array([v_goal_min], dtype=np.float32)
+                save_d["traj_time_goal_r_stop"] = np.array([float(getattr(args, "traj_time_goal_r_stop", 0.20))], dtype=np.float32)
+                save_d["traj_time_goal_k"] = np.array([float(getattr(args, "traj_time_goal_k", 0.05))], dtype=np.float32)
+                save_d["traj_time_obs_clr0_factor"] = np.array([float(getattr(args, "traj_time_obs_clr0_factor", 2.0))], dtype=np.float32)
+                save_d["traj_time_obs_clr_k_factor"] = np.array([float(getattr(args, "traj_time_obs_clr_k_factor", 0.5))], dtype=np.float32)
+                save_d["traj_time_dt_min"] = np.array([float(getattr(args, "traj_time_dt_min", 1e-4))], dtype=np.float32)
+                save_d["traj_time_dt_max"] = np.array([float(getattr(args, "traj_time_dt_max", 10.0))], dtype=np.float32)
+                save_d["traj_time_kappa_ref_p"] = np.array([float(getattr(args, "traj_time_kappa_ref_p", 95.0))], dtype=np.float32)
+                save_d["traj_time_cap_smooth_window"] = np.array([int(getattr(args, "traj_time_cap_smooth_window", 1))], dtype=np.int64)
+                save_d["traj_time_j_max"] = np.array([float(getattr(args, "traj_time_j_max", 0.0))], dtype=np.float32)
+                save_d["traj_time_j_iters"] = np.array([int(getattr(args, "traj_time_j_iters", 3))], dtype=np.int64)
+                if traj_exec_time is not None:
+                    save_d["traj_exec_enable"] = np.array([1], dtype=np.int64)
+                    save_d["traj_exec_dt"] = np.array([float(getattr(args, "traj_exec_dt", 0.02))], dtype=np.float32)
+                    save_d["traj_exec_len"] = np.asarray(traj_exec_len, dtype=np.int64)
+                    save_d["traj_exec_time"] = np.asarray(traj_exec_time, dtype=np.float32)
+                    save_d["traj_exec_xyz"] = np.asarray(traj_exec_xyz, dtype=np.float32)
+                    save_d["traj_exec_vel"] = np.asarray(traj_exec_vel, dtype=np.float32)
+            else:
+                save_d["traj_time_enable"] = np.array([0], dtype=np.int64)
+            if "obst_baseline_clr_min" in case_obst_meta:
+                try:
+                    save_d["obst_baseline_clr_min"] = np.array([float(case_obst_meta["obst_baseline_clr_min"])], dtype=np.float32)
+                except Exception:
+                    pass
+            if "obst_block_thr" in case_obst_meta:
+                try:
+                    save_d["obst_block_thr"] = np.array([float(case_obst_meta["obst_block_thr"])], dtype=np.float32)
+                except Exception:
+                    pass
+            if isinstance(case_obst_meta.get("obst_blocking_mask", None), np.ndarray):
+                save_d["obst_blocking_mask"] = np.asarray(case_obst_meta["obst_blocking_mask"], dtype=np.int64).reshape(-1)
+
+            if cp_np_raw is not None:
+                save_d["cp_raw"] = cp_np_raw
+            np.savez(out_npz, **save_d)
+
+            return dict(
+                out_npz=out_npz,
+                e_start_best=e_start_best,
+                e_goal_best=e_goal_best,
+                e_grasp_best=e_grasp_best,
+                succ_all3=succ_all3,
+                uav_a_best=uav_a_best,
+                uav_j_best=uav_j_best,
+                yaw_a_best=yaw_a_best,
+                arm_a_best=arm_a_best,
+                path_len=float(path_len[best_idx]),
+                path_ratio=float(path_ratio[best_idx]),
+                turn_xy=float(turn_xy[best_idx]),
+                straight_ratio=float(straight_ratio[best_idx]),
+                clr=float(obst_clr_best),
+                has_collision=has_collision,
+                has_unsafe=has_unsafe,
+            )
+
+        res_on = _run_one_pass(obst_influence_enable=True, out_suffix="", label="ON")
+        best_start.append(float(res_on["e_start_best"]))
+        best_goal.append(float(res_on["e_goal_best"]))
+        best_grasp.append(float(res_on["e_grasp_best"]))
+        best_succ_all3.append(float(res_on["succ_all3"]))
+        best_uav_a.append(float(res_on["uav_a_best"]))
+        best_uav_j.append(float(res_on["uav_j_best"]))
+        best_yaw_a.append(float(res_on["yaw_a_best"]))
+        best_arm_a.append(float(res_on["arm_a_best"]))
+        best_path_len.append(float(res_on["path_len"]))
+        best_path_ratio.append(float(res_on["path_ratio"]))
+        best_turn_xy.append(float(res_on["turn_xy"]))
+        best_straight_ratio.append(float(res_on["straight_ratio"]))
         if args.obst_enable and len(case_spheres) > 0:
-            msg += f" | obst_clr_min={obst_clr_best:.4f} m"
-        msg += f" | path_len={float(path_len[best_idx]):.4f} m (ratio={float(path_ratio[best_idx]):.3f})"
-        msg += f" | turn_xy={float(turn_xy[best_idx]):.4f} | straight_ratio={float(straight_ratio[best_idx]):.3f}"
-        msg += f" | succ@2cm(all3)={succ_all3:.3f}"
-        print(msg)
-
-        best_start.append(e_start_best)
-        best_goal.append(e_goal_best)
-        best_grasp.append(e_grasp_best)
-        best_succ_all3.append(succ_all3)
-
-        best_uav_a.append(uav_a_best)
-        best_uav_j.append(uav_j_best)
-        best_yaw_a.append(yaw_a_best)
-        best_arm_a.append(arm_a_best)
-        best_path_len.append(float(path_len[best_idx]))
-        best_path_ratio.append(float(path_ratio[best_idx]))
-        best_turn_xy.append(float(turn_xy[best_idx]))
-        best_straight_ratio.append(float(straight_ratio[best_idx]))
-        if args.obst_enable and len(case_spheres) > 0:
-            best_obst_clr.append(obst_clr_best)
+            best_obst_clr.append(float(res_on["clr"]))
             best_anchor_feasible.append(int(anchor_feasible))
 
-        out_npz = os.path.join(args.save_dir, f"case_{idx:04d}_samples.npz")
-        if args.obst_enable:
-            obst_spheres_all_np = np.array(
-                [[float(c[0]), float(c[1]), float(c[2]), float(r)] for c, r in case_spheres],
-                dtype=np.float32,
-            ).reshape(-1, 4)
-            obst_sphere_from_box_np = np.array(case_sphere_from_box, dtype=np.int64).reshape(-1)
-            if obst_sphere_from_box_np.shape[0] != obst_spheres_all_np.shape[0]:
-                obst_sphere_from_box_np = np.zeros((obst_spheres_all_np.shape[0],), dtype=np.int64)
-            obst_spheres_raw_np = obst_spheres_all_np[obst_sphere_from_box_np == 0].reshape(-1, 4)
-            obst_spheres_proxy_np = obst_spheres_all_np[obst_sphere_from_box_np != 0].reshape(-1, 4)
-            obst_boxes_np = np.array(
-                [[float(c[0]), float(c[1]), float(c[2]), float(h[0]), float(h[1]), float(h[2])] for c, h in case_boxes],
-                dtype=np.float32,
-            ).reshape(-1, 6)
-        else:
-            obst_spheres_all_np = np.zeros((0, 4), dtype=np.float32)
-            obst_spheres_raw_np = np.zeros((0, 4), dtype=np.float32)
-            obst_spheres_proxy_np = np.zeros((0, 4), dtype=np.float32)
-            obst_sphere_from_box_np = np.zeros((0,), dtype=np.int64)
-            obst_boxes_np = np.zeros((0, 6), dtype=np.float32)
-
-        save_d = dict(
-            cp=cp_np,
-            q_start=data_cpu["q_start"].numpy(),
-            q_goal=data_cpu["q_goal"].numpy(),
-            q_grasp=data_cpu["q_grasp"].numpy(),
-            best_idx=np.array([best_idx], dtype=np.int64),
-            best_idx_selection=np.array([best_idx_selection], dtype=np.int64),
-            best_idx_grasp=np.array([best_idx_grasp], dtype=np.int64),
-            selected_sid=np.array([sid_selected], dtype=np.int64),
-            sid_final=np.array([best_idx], dtype=np.int64),
-            start_errs=start_errs.astype(np.float32),
-            goal_errs=goal_errs.astype(np.float32),
-            grasp_errs=grasp_errs.astype(np.float32),
-            succ_all3=np.array([succ_all3], dtype=np.float32),
-            uav_a_mean=uav_a_mean.astype(np.float32),
-            uav_j_mean=uav_j_mean.astype(np.float32),
-            yaw_a_mean=yaw_a_mean.astype(np.float32),
-            arm_a_mean=arm_a_mean.astype(np.float32),
-            path_len=path_len.astype(np.float32),
-            path_ratio=path_ratio.astype(np.float32),
-            turn_xy=turn_xy.astype(np.float32),
-            uav_turn=turn_xy.astype(np.float32),
-            straight_ratio=straight_ratio.astype(np.float32),
-            straight_len=np.array([straight_len], dtype=np.float32),
-            obst_clr_min=obst_clr_min.astype(np.float32),
-            mode=np.array([args.mode]),
-            ctx_mode=np.array([args.ctx_mode]),
-            seed=np.array([args.seed], dtype=np.int64),
-            no_wrap_patch=np.array([int(args.no_wrap_patch)], dtype=np.int64),
-            t_g_tag=tag_tg.numpy(),
-            obst_enable=np.array([int(args.obst_enable)], dtype=np.int64),
-            obst_alpha=np.array([float(args.obst_alpha)], dtype=np.float32),
-            obst_margin=np.array([float(args.obst_margin)], dtype=np.float32),
-            obst_spheres=obst_spheres_all_np,
-            obst_spheres_raw=obst_spheres_raw_np,
-            obst_spheres_proxy=obst_spheres_proxy_np,
-            obst_sphere_from_box=obst_sphere_from_box_np,
-            obst_boxes=obst_boxes_np,
-            obst_safe_margin=np.array([float(args.obst_safe_margin)], dtype=np.float32),
-            obst_select_min_clearance=np.array([float(args.obst_select_min_clearance)], dtype=np.float32),
-            obst_uav_radius=np.array([float(getattr(args, "obst_uav_radius", 0.0))], dtype=np.float32),
-            obst_project_enable=np.array([int(args.obst_project_enable)], dtype=np.int64),
-            obst_proj_iters=np.array([int(args.obst_proj_iters)], dtype=np.int64),
-            obst_proj_lr=np.array([float(args.obst_proj_lr)], dtype=np.float32),
-            obst_proj_w_data=np.array([float(args.obst_proj_w_data)], dtype=np.float32),
-            obst_proj_w_a=np.array([float(args.obst_proj_w_a)], dtype=np.float32),
-            obst_proj_w_j=np.array([float(args.obst_proj_w_j)], dtype=np.float32),
-            obst_proj_w_obst=np.array([float(args.obst_proj_w_obst)], dtype=np.float32),
-        )
-        if cp_np_raw is not None:
-            save_d["cp_raw"] = cp_np_raw
-        np.savez(out_npz, **save_d)
+        if args.obst_effect_check:
+            res_off = _run_one_pass(obst_influence_enable=False, out_suffix="_obst_off", label="OFF")
+            print(
+                f"[OBST_EFFECT] case={idx:04d} "
+                f"len_on={float(res_on['path_len']):.4f} len_off={float(res_off['path_len']):.4f} "
+                f"clr_on={float(res_on['clr']):.4f} clr_off={float(res_off['clr']):.4f} "
+                f"unsafe_on={int(res_on['has_unsafe'])} unsafe_off={int(res_off['has_unsafe'])} "
+                f"coll_on={int(res_on['has_collision'])} coll_off={int(res_off['has_collision'])} "
+                f"npz_on={res_on['out_npz']} npz_off={res_off['out_npz']}"
+            )
 
     if len(best_start) > 0:
         s0 = _stats_np(best_start)
